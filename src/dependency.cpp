@@ -569,10 +569,8 @@ int main(int argc, char* argv[])
     // std::cout << "Time taken by sz compression is: " << std::fixed << std::setprecision(5)
     //           << sz_time_taken << " sec" << std::endl;
 
-    auto sz_destart = std::chrono::high_resolution_clock::now();
-    float* decompressed_data = SZ_decompress4De(tmp, szcompressedSize, low_dim_x, low_dim_y, low_dim_z);
-    auto sz_deend = std::chrono::high_resolution_clock::now();
-    double sz_time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(sz_deend - sz_destart).count() * 1e-9;
+    float* decompressed_data = nullptr;
+    double sz_time_taken_decompress = 0.0;
     // std::cout << "Time taken by sz decompression is: " << std::fixed << std::setprecision(5)
     //         << sz_time_taken_decompress << " sec" << std::endl;
     // writeBinaryData("tur-low-2.raw", decompressed_data, full_dim_z/4 * full_dim_y/4 * full_dim_x/4);
@@ -593,37 +591,23 @@ int main(int argc, char* argv[])
     const int single_axis_blocks[3] = {0, 1, 3};
     const int double_axis_blocks[3] = {2, 4, 5};
     const size_t low_num_elements = low_dim_z * low_dim_y * low_dim_x;
-    double low_comp_phase[7] = {0.0};
-    double low_decomp_sz_phase[7] = {0.0};
-    double low_depre_phase[7] = {0.0};
 
+    auto low_start = std::chrono::high_resolution_clock::now();
     #pragma omp parallel for reduction(+:allSize)
     for (int i = 0; i < 3; ++i) {
-        auto phase_start = std::chrono::high_resolution_clock::now();
         int block = single_axis_blocks[i];
         preprocess_block(block, low_block_data[block+1], low_block_data[0], low_diff_data[block],
                            low_dim_x, low_dim_y, low_dim_z);
         scaleData(low_diff_data[block], low_num_elements, residual_scale);
         low_comp[block] = SZ_compress(low_diff_data[block], low_dim_x, low_dim_y, low_dim_z, 2.5 * eb, low_compressedSize[block]);
         allSize += low_compressedSize[block];
-        auto phase_comp_end = std::chrono::high_resolution_clock::now();
-        low_deData[block] = SZ_decompress_separated(low_comp[block], low_compressedSize[block], low_dim_x, low_dim_y, low_dim_z);
-        scaleData(low_deData[block], low_num_elements, 1.0f / residual_scale);
-        auto phase_decomp_sz_end = std::chrono::high_resolution_clock::now();
-        depreprocess_block(block, low_deData[block], low_block_data[0], low_de_sub_block[block],
+        scaleData(low_diff_data[block], low_num_elements, 1.0f / residual_scale);
+        depreprocess_block(block, low_diff_data[block], low_block_data[0], low_de_sub_block[block],
                            low_dim_x, low_dim_y, low_dim_z);
-        auto phase_depre_end = std::chrono::high_resolution_clock::now();
-        double local_comp_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_comp_end - phase_start).count() * 1e-9;
-        double local_decomp_sz_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_decomp_sz_end - phase_comp_end).count() * 1e-9;
-        double local_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_depre_end - phase_decomp_sz_end).count() * 1e-9;
-        low_comp_phase[block] = local_comp_time;
-        low_decomp_sz_phase[block] = local_decomp_sz_time;
-        low_depre_phase[block] = local_depre_time;
     }
 
     #pragma omp parallel for reduction(+:allSize)
     for (int i = 0; i < 3; ++i) {
-        auto phase_start = std::chrono::high_resolution_clock::now();
         int block = double_axis_blocks[i];
         preprocess_block_staged(block, low_block_data[block+1], low_de_sub_block[0], low_de_sub_block[1],
                                 low_de_sub_block[3], low_de_sub_block[2], low_de_sub_block[4],
@@ -631,87 +615,41 @@ int main(int argc, char* argv[])
         scaleData(low_diff_data[block], low_num_elements, residual_scale);
         low_comp[block] = SZ_compress(low_diff_data[block], low_dim_x, low_dim_y, low_dim_z, 2.5 * eb, low_compressedSize[block]);
         allSize += low_compressedSize[block];
-        auto phase_comp_end = std::chrono::high_resolution_clock::now();
-        low_deData[block] = SZ_decompress_separated(low_comp[block], low_compressedSize[block], low_dim_x, low_dim_y, low_dim_z);
-        scaleData(low_deData[block], low_num_elements, 1.0f / residual_scale);
-        auto phase_decomp_sz_end = std::chrono::high_resolution_clock::now();
-        depreprocess_block_staged(block, low_deData[block], low_de_sub_block[0], low_de_sub_block[1],
+        scaleData(low_diff_data[block], low_num_elements, 1.0f / residual_scale);
+        depreprocess_block_staged(block, low_diff_data[block], low_de_sub_block[0], low_de_sub_block[1],
                                   low_de_sub_block[3], low_de_sub_block[2], low_de_sub_block[4],
                                   low_de_sub_block[5], low_de_sub_block[block], low_dim_x, low_dim_y, low_dim_z);
-        auto phase_depre_end = std::chrono::high_resolution_clock::now();
-        double local_comp_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_comp_end - phase_start).count() * 1e-9;
-        double local_decomp_sz_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_decomp_sz_end - phase_comp_end).count() * 1e-9;
-        double local_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_depre_end - phase_decomp_sz_end).count() * 1e-9;
-        low_comp_phase[block] = local_comp_time;
-        low_decomp_sz_phase[block] = local_decomp_sz_time;
-        low_depre_phase[block] = local_depre_time;
     }
 
-    auto low_block6_start = std::chrono::high_resolution_clock::now();
     preprocess_block_staged(6, low_block_data[7], low_de_sub_block[0], low_de_sub_block[1],
                             low_de_sub_block[3], low_de_sub_block[2], low_de_sub_block[4],
                             low_de_sub_block[5], low_diff_data[6], low_dim_x, low_dim_y, low_dim_z);
     scaleData(low_diff_data[6], low_num_elements, residual_scale);
     low_comp[6] = SZ_compress(low_diff_data[6], low_dim_x, low_dim_y, low_dim_z, 2.5 * eb, low_compressedSize[6]);
     allSize += low_compressedSize[6];
-    auto low_block6_comp_end = std::chrono::high_resolution_clock::now();
-    low_deData[6] = SZ_decompress_separated(low_comp[6], low_compressedSize[6], low_dim_x, low_dim_y, low_dim_z);
-    scaleData(low_deData[6], low_num_elements, 1.0f / residual_scale);
-    auto low_block6_decomp_sz_end = std::chrono::high_resolution_clock::now();
-    depreprocess_block_staged(6, low_deData[6], low_de_sub_block[0], low_de_sub_block[1],
+    scaleData(low_diff_data[6], low_num_elements, 1.0f / residual_scale);
+    depreprocess_block_staged(6, low_diff_data[6], low_de_sub_block[0], low_de_sub_block[1],
                               low_de_sub_block[3], low_de_sub_block[2], low_de_sub_block[4],
                               low_de_sub_block[5], low_de_sub_block[6], low_dim_x, low_dim_y, low_dim_z);
-    auto low_block6_depre_end = std::chrono::high_resolution_clock::now();
-    double low_block6_comp_time = std::chrono::duration_cast<std::chrono::nanoseconds>(low_block6_comp_end - low_block6_start).count() * 1e-9;
-    double low_block6_decomp_sz_time = std::chrono::duration_cast<std::chrono::nanoseconds>(low_block6_decomp_sz_end - low_block6_comp_end).count() * 1e-9;
-    double low_block6_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(low_block6_depre_end - low_block6_decomp_sz_end).count() * 1e-9;
-    low_comp_phase[6] = low_block6_comp_time;
-    low_decomp_sz_phase[6] = low_block6_decomp_sz_time;
-    low_depre_phase[6] = low_block6_depre_time;
-    bool use_parallel_group_time = false;
-    #ifdef _OPENMP
-    use_parallel_group_time = omp_get_max_threads() > 1;
-    #endif
-    auto group_time = [use_parallel_group_time](const double phase[7], const int blocks[3]) {
-        double t = 0.0;
-        for (int i = 0; i < 3; ++i) {
-            double v = phase[blocks[i]];
-            if (use_parallel_group_time) {
-                if (v > t)
-                    t = v;
-            } else {
-                t += v;
-            }
-        }
-        return t;
-    };
-    double low_time_taken = group_time(low_comp_phase, single_axis_blocks) + group_time(low_comp_phase, double_axis_blocks) + low_comp_phase[6];
-    double low_time_taken_decompress_sz = group_time(low_decomp_sz_phase, single_axis_blocks) + group_time(low_decomp_sz_phase, double_axis_blocks) + low_decomp_sz_phase[6];
-    double low_time_taken_decompress = low_time_taken_decompress_sz + group_time(low_depre_phase, single_axis_blocks) + group_time(low_depre_phase, double_axis_blocks) + low_depre_phase[6];
-    // std::cout << "Time taken by low_decompression is: " << std::fixed << std::setprecision(5)
-    //           << low_time_taken_decompress << " sec" << std::endl;
+    auto low_end = std::chrono::high_resolution_clock::now();
+    double low_time_taken = std::chrono::duration_cast<std::chrono::nanoseconds>(low_end - low_start).count() * 1e-9;
     
     auto reconstructed_low_start = std::chrono::high_resolution_clock::now();
     float* reconstructed_sub_0 = new float[dim_z * dim_x * dim_y];
     float* all_low_blocks[8] = {
-        low_block_data[0],          // vs ori sub_block_0
-        low_de_sub_block[0],      // sub_block_1
-        low_de_sub_block[1],      // sub_block_2
-        low_de_sub_block[2],      // sub_block_3
-        low_de_sub_block[3],      // sub_block_4
-        low_de_sub_block[4],      // sub_block_5
-        low_de_sub_block[5],      // sub_block_6
-        low_de_sub_block[6]       // sub_block_7
+        low_block_data[0],
+        low_de_sub_block[0],
+        low_de_sub_block[1],
+        low_de_sub_block[2],
+        low_de_sub_block[3],
+        low_de_sub_block[4],
+        low_de_sub_block[5],
+        low_de_sub_block[6]
     };
     merge_sub_blocks_to_full(all_low_blocks, reconstructed_sub_0, low_dim_x, low_dim_y, low_dim_z);
-    // writeBinaryData("tur-mid-2.raw", reconstructed_sub_0, full_dim_z/2 * full_dim_y/2 * full_dim_x/2);
     auto reconstructed_low_end = std::chrono::high_resolution_clock::now();
     double time_taken_reconstructed_low = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_low_end - reconstructed_low_start).count() * 1e-9;
-    // std::cout << "Time taken by reconstructed_low is: " << std::fixed << std::setprecision(5)
-    //           << time_taken_reconstructed_low << " sec" << std::endl;
     
-
-    // Allocate buffers for diff, decompressed, and reconstructed data for 7 blocks.
     char* comp[7];
     float* diff_data[7];
     float* deData[7];
@@ -725,37 +663,23 @@ int main(int argc, char* argv[])
     }
 
     const size_t num_elements = dim_z * dim_y * dim_x;
-    double full_comp_phase[7] = {0.0};
-    double full_decomp_sz_phase[7] = {0.0};
-    double full_depre_phase[7] = {0.0};
 
+    auto start = std::chrono::high_resolution_clock::now();
     #pragma omp parallel for reduction(+:allSize)
     for (int i = 0; i < 3; ++i) {
-        auto phase_start = std::chrono::high_resolution_clock::now();
         int block = single_axis_blocks[i];
         preprocess_block(block, sub_block_data[block+1], reconstructed_sub_0, diff_data[block],
                            dim_x, dim_y, dim_z);
         scaleData(diff_data[block], num_elements, residual_scale);
         comp[block] = SZ_compress(diff_data[block], dim_x, dim_y, dim_z, 6.25 * eb, compressedSize[block]);
         allSize += compressedSize[block];
-        auto phase_comp_end = std::chrono::high_resolution_clock::now();
-        deData[block] = SZ_decompress_separated(comp[block], compressedSize[block], dim_x, dim_y, dim_z);
-        scaleData(deData[block], num_elements, 1.0f / residual_scale);
-        auto phase_decomp_sz_end = std::chrono::high_resolution_clock::now();
-        depreprocess_block(block, deData[block], reconstructed_sub_0, de_sub_block[block],
+        scaleData(diff_data[block], num_elements, 1.0f / residual_scale);
+        depreprocess_block(block, diff_data[block], reconstructed_sub_0, de_sub_block[block],
                            dim_x, dim_y, dim_z);
-        auto phase_depre_end = std::chrono::high_resolution_clock::now();
-        double local_comp_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_comp_end - phase_start).count() * 1e-9;
-        double local_decomp_sz_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_decomp_sz_end - phase_comp_end).count() * 1e-9;
-        double local_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_depre_end - phase_decomp_sz_end).count() * 1e-9;
-        full_comp_phase[block] = local_comp_time;
-        full_decomp_sz_phase[block] = local_decomp_sz_time;
-        full_depre_phase[block] = local_depre_time;
     }
 
     #pragma omp parallel for reduction(+:allSize)
     for (int i = 0; i < 3; ++i) {
-        auto phase_start = std::chrono::high_resolution_clock::now();
         int block = double_axis_blocks[i];
         preprocess_block_staged(block, sub_block_data[block+1], de_sub_block[0], de_sub_block[1],
                                 de_sub_block[3], de_sub_block[2], de_sub_block[4],
@@ -763,73 +687,107 @@ int main(int argc, char* argv[])
         scaleData(diff_data[block], num_elements, residual_scale);
         comp[block] = SZ_compress(diff_data[block], dim_x, dim_y, dim_z, 6.25 * eb, compressedSize[block]);
         allSize += compressedSize[block];
-        auto phase_comp_end = std::chrono::high_resolution_clock::now();
-        deData[block] = SZ_decompress_separated(comp[block], compressedSize[block], dim_x, dim_y, dim_z);
-        scaleData(deData[block], num_elements, 1.0f / residual_scale);
-        auto phase_decomp_sz_end = std::chrono::high_resolution_clock::now();
-        depreprocess_block_staged(block, deData[block], de_sub_block[0], de_sub_block[1],
+        scaleData(diff_data[block], num_elements, 1.0f / residual_scale);
+        depreprocess_block_staged(block, diff_data[block], de_sub_block[0], de_sub_block[1],
                                   de_sub_block[3], de_sub_block[2], de_sub_block[4],
                                   de_sub_block[5], de_sub_block[block], dim_x, dim_y, dim_z);
-        auto phase_depre_end = std::chrono::high_resolution_clock::now();
-        double local_comp_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_comp_end - phase_start).count() * 1e-9;
-        double local_decomp_sz_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_decomp_sz_end - phase_comp_end).count() * 1e-9;
-        double local_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(phase_depre_end - phase_decomp_sz_end).count() * 1e-9;
-        full_comp_phase[block] = local_comp_time;
-        full_decomp_sz_phase[block] = local_decomp_sz_time;
-        full_depre_phase[block] = local_depre_time;
     }
 
-    auto full_block6_start = std::chrono::high_resolution_clock::now();
     preprocess_block_staged(6, sub_block_data[7], de_sub_block[0], de_sub_block[1],
                             de_sub_block[3], de_sub_block[2], de_sub_block[4],
                             de_sub_block[5], diff_data[6], dim_x, dim_y, dim_z);
     scaleData(diff_data[6], num_elements, residual_scale);
     comp[6] = SZ_compress(diff_data[6], dim_x, dim_y, dim_z, 6.25 * eb, compressedSize[6]);
     allSize += compressedSize[6];
-    auto full_block6_comp_end = std::chrono::high_resolution_clock::now();
-    deData[6] = SZ_decompress_separated(comp[6], compressedSize[6], dim_x, dim_y, dim_z);
-    scaleData(deData[6], num_elements, 1.0f / residual_scale);
-    auto full_block6_decomp_sz_end = std::chrono::high_resolution_clock::now();
-    depreprocess_block_staged(6, deData[6], de_sub_block[0], de_sub_block[1],
-                              de_sub_block[3], de_sub_block[2], de_sub_block[4],
-                              de_sub_block[5], de_sub_block[6], dim_x, dim_y, dim_z);
-    auto full_block6_depre_end = std::chrono::high_resolution_clock::now();
-    double full_block6_comp_time = std::chrono::duration_cast<std::chrono::nanoseconds>(full_block6_comp_end - full_block6_start).count() * 1e-9;
-    double full_block6_decomp_sz_time = std::chrono::duration_cast<std::chrono::nanoseconds>(full_block6_decomp_sz_end - full_block6_comp_end).count() * 1e-9;
-    double full_block6_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(full_block6_depre_end - full_block6_decomp_sz_end).count() * 1e-9;
-    full_comp_phase[6] = full_block6_comp_time;
-    full_decomp_sz_phase[6] = full_block6_decomp_sz_time;
-    full_depre_phase[6] = full_block6_depre_time;
+    auto end = std::chrono::high_resolution_clock::now();
+    double time_taken = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1e-9;
+    double global_compress_time = std::chrono::duration_cast<std::chrono::nanoseconds>(end - split_start).count() * 1e-9;
+
     double original_size = (double)full_dim_z * full_dim_y * full_dim_x * sizeof(float);
     double CR = original_size / (double)allSize;
     std::cout << "CR: " << CR << std::endl;
 
-    double time_taken = group_time(full_comp_phase, single_axis_blocks) + group_time(full_comp_phase, double_axis_blocks) + full_comp_phase[6];
-    // std::cout << "Time taken by compression is: " << std::fixed << std::setprecision(5)
-    //           << time_taken << " sec" << std::endl;
+    auto global_decompress_start = std::chrono::high_resolution_clock::now();
+    decompressed_data = SZ_decompress4De(tmp, szcompressedSize, low_dim_x, low_dim_y, low_dim_z);
+    auto sz_deend = std::chrono::high_resolution_clock::now();
+    sz_time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(sz_deend - global_decompress_start).count() * 1e-9;
 
-    double time_taken_decompress_sz = group_time(full_decomp_sz_phase, single_axis_blocks) + group_time(full_decomp_sz_phase, double_axis_blocks) + full_decomp_sz_phase[6];
-    double time_taken_decompress = time_taken_decompress_sz + group_time(full_depre_phase, single_axis_blocks) + group_time(full_depre_phase, double_axis_blocks) + full_depre_phase[6];
-    // std::cout << "Time taken by decompression is: " << std::fixed << std::setprecision(5)
-    //           << time_taken_decompress << " sec" << std::endl;
+    auto low_decompress_start = std::chrono::high_resolution_clock::now();
+    #pragma omp parallel for
+    for (int block = 0; block < 7; ++block) {
+        low_deData[block] = SZ_decompress_separated(low_comp[block], low_compressedSize[block], low_dim_x, low_dim_y, low_dim_z);
+        scaleData(low_deData[block], low_num_elements, 1.0f / residual_scale);
+    }
+    auto low_decompress_end_sz = std::chrono::high_resolution_clock::now();
+    double low_time_taken_decompress_sz = std::chrono::duration_cast<std::chrono::nanoseconds>(low_decompress_end_sz - low_decompress_start).count() * 1e-9;
+    #pragma omp parallel for
+    for (int i = 0; i < 3; ++i) {
+        int block = single_axis_blocks[i];
+        depreprocess_block(block, low_deData[block], decompressed_data, low_de_sub_block[block],
+                           low_dim_x, low_dim_y, low_dim_z);
+    }
+    #pragma omp parallel for
+    for (int i = 0; i < 3; ++i) {
+        int block = double_axis_blocks[i];
+        depreprocess_block_staged(block, low_deData[block], low_de_sub_block[0], low_de_sub_block[1],
+                                  low_de_sub_block[3], low_de_sub_block[2], low_de_sub_block[4],
+                                  low_de_sub_block[5], low_de_sub_block[block], low_dim_x, low_dim_y, low_dim_z);
+    }
+    depreprocess_block_staged(6, low_deData[6], low_de_sub_block[0], low_de_sub_block[1],
+                              low_de_sub_block[3], low_de_sub_block[2], low_de_sub_block[4],
+                              low_de_sub_block[5], low_de_sub_block[6], low_dim_x, low_dim_y, low_dim_z);
+    auto low_decompress_end = std::chrono::high_resolution_clock::now();
+    double low_time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(low_decompress_end - low_decompress_start).count() * 1e-9;
+
+    auto reconstructed_low_decompress_start = std::chrono::high_resolution_clock::now();
+    all_low_blocks[0] = decompressed_data;
+    merge_sub_blocks_to_full(all_low_blocks, reconstructed_sub_0, low_dim_x, low_dim_y, low_dim_z);
+    auto reconstructed_low_decompress_end = std::chrono::high_resolution_clock::now();
+    double time_taken_reconstructed_low_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_low_decompress_end - reconstructed_low_decompress_start).count() * 1e-9;
+
+    auto decompress_start = std::chrono::high_resolution_clock::now();
+    #pragma omp parallel for
+    for (int block = 0; block < 7; ++block) {
+        deData[block] = SZ_decompress_separated(comp[block], compressedSize[block], dim_x, dim_y, dim_z);
+        scaleData(deData[block], num_elements, 1.0f / residual_scale);
+    }
+    auto decompress_end_sz = std::chrono::high_resolution_clock::now();
+    double time_taken_decompress_sz = std::chrono::duration_cast<std::chrono::nanoseconds>(decompress_end_sz - decompress_start).count() * 1e-9;
+    #pragma omp parallel for
+    for (int i = 0; i < 3; ++i) {
+        int block = single_axis_blocks[i];
+        depreprocess_block(block, deData[block], reconstructed_sub_0, de_sub_block[block],
+                           dim_x, dim_y, dim_z);
+    }
+    #pragma omp parallel for
+    for (int i = 0; i < 3; ++i) {
+        int block = double_axis_blocks[i];
+        depreprocess_block_staged(block, deData[block], de_sub_block[0], de_sub_block[1],
+                                  de_sub_block[3], de_sub_block[2], de_sub_block[4],
+                                  de_sub_block[5], de_sub_block[block], dim_x, dim_y, dim_z);
+    }
+    depreprocess_block_staged(6, deData[6], de_sub_block[0], de_sub_block[1],
+                              de_sub_block[3], de_sub_block[2], de_sub_block[4],
+                              de_sub_block[5], de_sub_block[6], dim_x, dim_y, dim_z);
+    auto decompress_end = std::chrono::high_resolution_clock::now();
+    double time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(decompress_end - decompress_start).count() * 1e-9;
 
     auto reconstructed_full_start = std::chrono::high_resolution_clock::now();
     float* reconstructed_full_data = new float[full_dim_z * full_dim_y * full_dim_x];
     float* all_sub_blocks[8] = {
-        reconstructed_sub_0,          // vs ori sub_block_0
-        de_sub_block[0],      // sub_block_1
-        de_sub_block[1],      // sub_block_2
-        de_sub_block[2],      // sub_block_3
-        de_sub_block[3],      // sub_block_4
-        de_sub_block[4],      // sub_block_5
-        de_sub_block[5],      // sub_block_6
-        de_sub_block[6]       // sub_block_7
+        reconstructed_sub_0,
+        de_sub_block[0],
+        de_sub_block[1],
+        de_sub_block[2],
+        de_sub_block[3],
+        de_sub_block[4],
+        de_sub_block[5],
+        de_sub_block[6]
     };
     merge_sub_blocks_to_full(all_sub_blocks, reconstructed_full_data, dim_x, dim_y, dim_z);
     auto reconstructed_full_end = std::chrono::high_resolution_clock::now();
     double time_taken_reconstructed_full = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_full_end - reconstructed_full_start).count() * 1e-9;
-    // std::cout << "Time taken by reconstructed_full is: " << std::fixed << std::setprecision(5)
-    //           << time_taken_reconstructed_full << " sec" << std::endl;
+    double global_decompress_time = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_full_end - global_decompress_start).count() * 1e-9;
 
     // writeBinaryData("ours.raw", reconstructed_full_data, full_dim_z * full_dim_y * full_dim_x);
 
@@ -870,13 +828,20 @@ int main(int argc, char* argv[])
     // writeBinaryData("/N/u/daocwang/BigRed200/stream/sz.out_0", reconstructed_sub_0, dim_z * dim_xy);
 
     std::cout << "compress time is: " << std::fixed << std::setprecision(5)
-              << sz_time_taken_split + low_time_taken + low_time_taken_decompress - low_time_taken_decompress_sz + time_taken_reconstructed_low + time_taken << " sec" << std::endl;
+              << sz_time_taken_split + low_time_taken + time_taken_reconstructed_low + time_taken << " sec" << std::endl;
     
     std::cout << "decompress time is: " << std::fixed << std::setprecision(5)
-              << sz_time_taken_decompress + low_time_taken_decompress + time_taken_reconstructed_low + time_taken_decompress + time_taken_reconstructed_full << " sec" << std::endl;
+              << sz_time_taken_decompress + low_time_taken_decompress + time_taken_reconstructed_low_decompress + time_taken_decompress + time_taken_reconstructed_full << " sec" << std::endl;
+
+    std::cout << "global compress time is: " << std::fixed << std::setprecision(5)
+              << global_compress_time << " sec" << std::endl;
+
+    std::cout << "global decompress time is: " << std::fixed << std::setprecision(5)
+              << global_decompress_time << " sec" << std::endl;
 
     // (Free allocated memory as needed.)
     delete[] full_data;
+    delete[] decompressed_data;
     for (int i = 0; i < 8; ++i)
         delete[] sub_block_data[i];
     for (int i = 0; i < 7; ++i)
