@@ -780,7 +780,16 @@ float* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
     SZ3::uchar* buffer = nullptr;
     size_t bufferSize = 0;
     SZ3::Lossless_zstd lossless;
-    SZ3::Config conf(blksize_z, blksize_y, blksize_x);
+    SZ3::Config conf;
+    const SZ3::uchar* cmp_conf_pos = reinterpret_cast<const SZ3::uchar*>(compressedData);
+    conf.load(cmp_conf_pos);
+    const size_t expected_num = blksize_x * blksize_y * blksize_z;
+    if (conf.num != expected_num || conf.cmprAlgo != SZ3::ALGO_NOPRED) {
+        std::cerr << "Marked chunk decode expects an ALGO_NOPRED stream with "
+                  << expected_num << " values, got algo " << conf.cmprAlgo
+                  << " and num " << conf.num << std::endl;
+        return nullptr;
+    }
     const SZ3::uchar* cmp_pos = reinterpret_cast<const SZ3::uchar*>(compressedData) + conf.size_est();
     lossless.decompress(cmp_pos, outSize - conf.size_est(), buffer, bufferSize);
 
