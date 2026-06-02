@@ -131,10 +131,10 @@ template <typename T>
 static inline T blend4(T p0, T v0, T p1, T v1,
                            T p2, T v2, T p3, T v3)
 {
-    const T w0 = 1.0f / v0;
-    const T w1 = 1.0f / v1;
-    const T w2 = 1.0f / v2;
-    const T w3 = 1.0f / v3;
+    const T w0 = v1 * v2 * v3;
+    const T w1 = v0 * v2 * v3;
+    const T w2 = v0 * v1 * v3;
+    const T w3 = v0 * v1 * v2;
     return (w0 * p0 + w1 * p1 + w2 * p2 + w3 * p3) / (w0 + w1 + w2 + w3);
 }
 
@@ -855,19 +855,22 @@ T* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
         const size_t cx = rowMajorChunk % chunks_per_dim;
         const size_t cy = (rowMajorChunk / chunks_per_dim) % chunks_per_dim;
         const size_t cz = rowMajorChunk / (chunks_per_dim * chunks_per_dim);
-        for (size_t local = 0; local < chunk_volume; ++local) {
-            const size_t lx = local % chunk_dim;
-            const size_t ly = (local / chunk_dim) % chunk_dim;
-            const size_t lz = local / (chunk_dim * chunk_dim);
-            const size_t x = cx * chunk_dim + lx;
-            const size_t y = cy * chunk_dim + ly;
-            const size_t z = cz * chunk_dim + lz;
-            const size_t idx = (z * blksize_y + y) * blksize_x + x;
-            const int qi = quant_inds[q++];
-            if (qi == 0) {
-                unpredZeros++;
+        const size_t x0 = cx * chunk_dim;
+        const size_t y0 = cy * chunk_dim;
+        const size_t z0 = cz * chunk_dim;
+        const size_t plane = blksize_x * blksize_y;
+        for (size_t lz = 0; lz < chunk_dim; ++lz) {
+            const size_t zBase = (z0 + lz) * plane;
+            for (size_t ly = 0; ly < chunk_dim; ++ly) {
+                size_t idx = zBase + (y0 + ly) * blksize_x + x0;
+                for (size_t lx = 0; lx < chunk_dim; ++lx, ++idx) {
+                    const int qi = quant_inds[q++];
+                    if (qi == 0) {
+                        unpredZeros++;
+                    }
+                    deData[idx] = quantizer.recover(0, qi);
+                }
             }
-            deData[idx] = quantizer.recover(0, qi);
         }
     }
 
@@ -922,7 +925,7 @@ int run_typed(int argc, char* argv[])
 {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <error_bound> <raw_file> <cube_dim> <-f|-d> [x0 y0 z0 x1 y1 z1]"
+                  << " <error_bound> <raw_file> <cube_dim> <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
                   << std::endl;
         return 1;
     }
@@ -956,13 +959,37 @@ int run_typed(int argc, char* argv[])
         return 1;
     }
 
+    bool full_validate = true;
+    std::vector<int> query_args;
+    for (int arg = 5; arg < argc; ++arg) {
+        const std::string token = argv[arg];
+        if (token == "--query-only" || token == "--no-full-validate") {
+            full_validate = false;
+            continue;
+        }
+        char* end = nullptr;
+        const long value = std::strtol(argv[arg], &end, 10);
+        if (*argv[arg] == '\0' || *end != '\0') {
+            std::cerr << "Invalid argument '" << argv[arg]
+                      << "'. Expected ROI integer or --query-only." << std::endl;
+            return 1;
+        }
+        query_args.push_back(static_cast<int>(value));
+    }
+
     const int default_roi_dim = std::min(roi_full_dim, full_dim);
     QueryBox query = make_query(0, 0, 0, default_roi_dim - 1, default_roi_dim - 1, default_roi_dim - 1);
-    if (argc >= 11) {
-        query = make_query(atoi(argv[5]), atoi(argv[6]), atoi(argv[7]),
-                           atoi(argv[8]), atoi(argv[9]), atoi(argv[10]));
-    } else if (argc != 5) {
-        std::cerr << "ROI query must provide exactly six integers: x0 y0 z0 x1 y1 z1" << std::endl;
+    if (!query_args.empty()) {
+        if (query_args.size() != 6) {
+            std::cerr << "ROI query must provide exactly six integers: x0 y0 z0 x1 y1 z1" << std::endl;
+            return 1;
+        }
+        query = make_query(query_args[0], query_args[1], query_args[2],
+                           query_args[3], query_args[4], query_args[5]);
+    }
+    if (query.x.begin < 0 || query.y.begin < 0 || query.z.begin < 0 ||
+        query.x.end >= full_dim || query.y.end >= full_dim || query.z.end >= full_dim) {
+        std::cerr << "ROI query is out of bounds for cube_dim " << full_dim << std::endl;
         return 1;
     }
     std::cout << "Random-access Huffman marker test: low " << low_dim_x << "^3 uses "
@@ -974,6 +1001,9 @@ int run_typed(int argc, char* argv[])
               << query.y.begin << "," << query.y.end << "] x ["
               << query.z.begin << "," << query.z.end << "] "
               << (query.is_slice ? "(slice)" : "(box)") << std::endl;
+    if (!full_validate) {
+        std::cout << "Mode: query-only random access (skip full fine decode and PSNR validation)." << std::endl;
+    }
     T* full_data = new T[full_size];
     if (!readBinaryData(full_file_path, full_data, full_size))
     {
@@ -1019,10 +1049,10 @@ int run_typed(int argc, char* argv[])
     T* decompressed_data = nullptr;
     double sz_time_taken_decompress = 0.0;
 
-    char* low_comp[7];
-    T* low_diff_data[7];
-    T* low_deData[7];
-    T* low_de_sub_block[7];
+    char* low_comp[7] = {};
+    T* low_diff_data[7] = {};
+    T* low_deData[7] = {};
+    T* low_de_sub_block[7] = {};
     size_t low_compressedSize[7];
     #pragma omp parallel for 
     for (int i = 0; i < 7; ++i)
@@ -1072,16 +1102,18 @@ int run_typed(int argc, char* argv[])
     
 
     // Allocate buffers for diff, decompressed, and reconstructed data for 7 blocks.
-    char* comp[7];
-    T* diff_data[7];
-    T* deData[7];
-    T* de_sub_block[7];
+    char* comp[7] = {};
+    T* diff_data[7] = {};
+    T* deData[7] = {};
+    T* de_sub_block[7] = {};
     size_t compressedSize[7];
     for (int i = 0; i < 7; ++i)
     {
         diff_data[i]    = new T[dim_z * dim_x * dim_y];
-        deData[i]       = new T[dim_z * dim_x * dim_y];
-        de_sub_block[i] = new T[dim_z * dim_x * dim_y];
+        if (full_validate) {
+            deData[i]       = new T[dim_z * dim_x * dim_y];
+            de_sub_block[i] = new T[dim_z * dim_x * dim_y];
+        }
     }
 
     auto start = std::chrono::high_resolution_clock::now();
@@ -1118,15 +1150,21 @@ int run_typed(int argc, char* argv[])
     auto sz_deend = std::chrono::high_resolution_clock::now();
     sz_time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(sz_deend - global_decompress_start).count() * 1e-9;
 
+    double low_time_taken_decompress_sz = 0.0;
+    double low_time_taken_decompress = 0.0;
+    double time_taken_reconstructed_low_decompress = 0.0;
+    double time_taken_decompress_sz = 0.0;
+    double time_taken_decompress = 0.0;
+    if (full_validate) {
     auto low_decompress_start = std::chrono::high_resolution_clock::now();
-    #pragma omp parallel for 
+    #pragma omp parallel for
     for (int block = 0; block < 7; ++block)
     {
         low_deData[block] = SZ_decompress_separated<T>(low_comp[block], low_compressedSize[block],
                                                        low_dim_x, low_dim_y, low_dim_z, roi_low_dim);
     }
     auto low_decompress_end_sz = std::chrono::high_resolution_clock::now();
-    double low_time_taken_decompress_sz = std::chrono::duration_cast<std::chrono::nanoseconds>(low_decompress_end_sz - low_decompress_start).count() * 1e-9;
+    low_time_taken_decompress_sz = std::chrono::duration_cast<std::chrono::nanoseconds>(low_decompress_end_sz - low_decompress_start).count() * 1e-9;
     // std::cout << "Time taken by low_decompression_sz is: " << std::fixed << std::setprecision(5)
     //           << low_time_taken_decompress_sz << " sec" << std::endl;
     #pragma omp parallel for 
@@ -1137,7 +1175,7 @@ int run_typed(int argc, char* argv[])
                            low_dim_x, low_dim_y, low_dim_z);
     }
     auto low_decompress_end = std::chrono::high_resolution_clock::now();
-    double low_time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(low_decompress_end - low_decompress_start).count() * 1e-9;
+    low_time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(low_decompress_end - low_decompress_start).count() * 1e-9;
     // std::cout << "Time taken by low_decompression is: " << std::fixed << std::setprecision(5)
     //           << low_time_taken_decompress << " sec" << std::endl;
 
@@ -1145,17 +1183,17 @@ int run_typed(int argc, char* argv[])
     all_low_blocks[0] = decompressed_data;
     merge_sub_blocks_to_full(all_low_blocks, reconstructed_sub_0, low_dim_x, low_dim_y, low_dim_z);
     auto reconstructed_low_decompress_end = std::chrono::high_resolution_clock::now();
-    double time_taken_reconstructed_low_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_low_decompress_end - reconstructed_low_decompress_start).count() * 1e-9;
+    time_taken_reconstructed_low_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_low_decompress_end - reconstructed_low_decompress_start).count() * 1e-9;
 
     auto decompress_start = std::chrono::high_resolution_clock::now();
-    #pragma omp parallel for 
+    #pragma omp parallel for
     for (int block = 0; block < 7; ++block)
     {
         deData[block] = SZ_decompress_separated<T>(comp[block], compressedSize[block],
                                                    dim_x, dim_y, dim_z, roi_high_dim);
     }
     auto decompress_end_sz = std::chrono::high_resolution_clock::now();
-    double time_taken_decompress_sz = std::chrono::duration_cast<std::chrono::nanoseconds>(decompress_end_sz - decompress_start).count() * 1e-9;
+    time_taken_decompress_sz = std::chrono::duration_cast<std::chrono::nanoseconds>(decompress_end_sz - decompress_start).count() * 1e-9;
     // std::cout << "Time taken by decompression_sz is: " << std::fixed << std::setprecision(5)
     //           << time_taken_decompress_sz << " sec" << std::endl;
     #pragma omp parallel for 
@@ -1166,7 +1204,8 @@ int run_typed(int argc, char* argv[])
                            dim_x, dim_y, dim_z);
     }
     auto decompress_end = std::chrono::high_resolution_clock::now();
-    double time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(decompress_end - decompress_start).count() * 1e-9;
+    time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(decompress_end - decompress_start).count() * 1e-9;
+    }
     // std::cout << "Time taken by decompression is: " << std::fixed << std::setprecision(5)
     //           << time_taken_decompress << " sec" << std::endl;
 
@@ -1194,7 +1233,9 @@ int run_typed(int argc, char* argv[])
     for (int i = 0; i < 7; ++i) {
         query_low_ra_de_sub_block[i] = new T[low_dim_z * low_dim_y * low_dim_x];
         query_high_ra_de_sub_block[i] = new T[dim_z * dim_y * dim_x];
-        query_old_high_de_sub_block[i] = new T[dim_z * dim_y * dim_x];
+        if (full_validate) {
+            query_old_high_de_sub_block[i] = new T[dim_z * dim_y * dim_x];
+        }
     }
 
     size_t queryLowSymbols = 0;
@@ -1264,18 +1305,21 @@ int run_typed(int argc, char* argv[])
     auto query_high_decode_end = std::chrono::high_resolution_clock::now();
     double query_high_decode_time = std::chrono::duration_cast<std::chrono::nanoseconds>(query_high_decode_end - query_high_decode_start).count() * 1e-9;
 
-    auto query_old_high_depre_start = std::chrono::high_resolution_clock::now();
-    #pragma omp parallel for
-    for (int i = 0; i < static_cast<int>(highPlans.size()); ++i) {
-        const auto& plan = highPlans[i];
-        depreprocess_block(plan.block, deData[plan.block], reconstructed_sub_0,
-                           query_old_high_de_sub_block[plan.block],
-                           dim_x, dim_y, dim_z,
-                           plan.x.end + 1, plan.y.end + 1, plan.z.end + 1,
-                           plan.x.begin, plan.y.begin, plan.z.begin);
+    double query_old_high_depre_time = 0.0;
+    if (full_validate) {
+        auto query_old_high_depre_start = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel for
+        for (int i = 0; i < static_cast<int>(highPlans.size()); ++i) {
+            const auto& plan = highPlans[i];
+            depreprocess_block(plan.block, deData[plan.block], reconstructed_sub_0,
+                               query_old_high_de_sub_block[plan.block],
+                               dim_x, dim_y, dim_z,
+                               plan.x.end + 1, plan.y.end + 1, plan.z.end + 1,
+                               plan.x.begin, plan.y.begin, plan.z.begin);
+        }
+        auto query_old_high_depre_end = std::chrono::high_resolution_clock::now();
+        query_old_high_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(query_old_high_depre_end - query_old_high_depre_start).count() * 1e-9;
     }
-    auto query_old_high_depre_end = std::chrono::high_resolution_clock::now();
-    double query_old_high_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(query_old_high_depre_end - query_old_high_depre_start).count() * 1e-9;
 
     auto query_high_depre_start = std::chrono::high_resolution_clock::now();
     #pragma omp parallel for
@@ -1314,34 +1358,38 @@ int run_typed(int argc, char* argv[])
     double query_desplit_time = std::chrono::duration_cast<std::chrono::nanoseconds>(query_desplit_end - query_desplit_start).count() * 1e-9;
 
     double query_max_abs_diff = 0.0;
-    for (const auto& plan : highPlans) {
-        for (int z = plan.z.begin; z <= plan.z.end; ++z) {
-            for (int y = plan.y.begin; y <= plan.y.end; ++y) {
-                for (int x = plan.x.begin; x <= plan.x.end; ++x) {
-                    const size_t idx = z * dim_y * dim_x + y * dim_x + x;
-                    query_max_abs_diff = std::max(query_max_abs_diff,
-                        static_cast<double>(std::abs(query_old_high_de_sub_block[plan.block][idx] -
-                                                     query_high_ra_de_sub_block[plan.block][idx])));
+    if (full_validate) {
+        for (const auto& plan : highPlans) {
+            for (int z = plan.z.begin; z <= plan.z.end; ++z) {
+                for (int y = plan.y.begin; y <= plan.y.end; ++y) {
+                    for (int x = plan.x.begin; x <= plan.x.end; ++x) {
+                        const size_t idx = z * dim_y * dim_x + y * dim_x + x;
+                        query_max_abs_diff = std::max(query_max_abs_diff,
+                            static_cast<double>(std::abs(query_old_high_de_sub_block[plan.block][idx] -
+                                                         query_high_ra_de_sub_block[plan.block][idx])));
+                    }
                 }
             }
         }
     }
 
     double query_final_max_abs_diff = 0.0;
-    qout = 0;
-    for (int z = query.z.begin; z <= query.z.end; ++z) {
-        for (int y = query.y.begin; y <= query.y.end; ++y) {
-            for (int x = query.x.begin; x <= query.x.end; ++x) {
-                const int sub_index = ((z & 1) << 2) | ((y & 1) << 1) | (x & 1);
-                const int sub_z = z / 2;
-                const int sub_y = y / 2;
-                const int sub_x = x / 2;
-                const size_t src = sub_z * dim_y * dim_x + sub_y * dim_x + sub_x;
-                const T full_value = sub_index == 0
-                    ? reconstructed_sub_0[src]
-                    : de_sub_block[sub_index - 1][src];
-                query_final_max_abs_diff = std::max(query_final_max_abs_diff,
-                    static_cast<double>(std::abs(queryResult[qout++] - full_value)));
+    if (full_validate) {
+        qout = 0;
+        for (int z = query.z.begin; z <= query.z.end; ++z) {
+            for (int y = query.y.begin; y <= query.y.end; ++y) {
+                for (int x = query.x.begin; x <= query.x.end; ++x) {
+                    const int sub_index = ((z & 1) << 2) | ((y & 1) << 1) | (x & 1);
+                    const int sub_z = z / 2;
+                    const int sub_y = y / 2;
+                    const int sub_x = x / 2;
+                    const size_t src = sub_z * dim_y * dim_x + sub_y * dim_x + sub_x;
+                    const T full_value = sub_index == 0
+                        ? reconstructed_sub_0[src]
+                        : de_sub_block[sub_index - 1][src];
+                    query_final_max_abs_diff = std::max(query_final_max_abs_diff,
+                        static_cast<double>(std::abs(queryResult[qout++] - full_value)));
+                }
             }
         }
     }
@@ -1349,26 +1397,29 @@ int run_typed(int argc, char* argv[])
     std::cout << "Auto query high residual blocks decoded: " << blocks_to_string(highPlans) << std::endl;
     std::cout << "Auto query low residual blocks decoded: " << blocks_to_string(lowPlans) << std::endl;
     std::cout << "Auto query chunks low/high: " << queryLowChunks << " / " << queryHighChunks << std::endl;
-    std::cout << "Auto query marker fine decode time: "
-              << query_low_decode_time + query_high_decode_time << " sec" << std::endl;
-    std::cout << "Auto query marker fine depreprocess time: "
-              << query_low_depre_time + query_high_depre_time << " sec" << std::endl;
-    std::cout << "Auto query ref reconstruct/desplit time: "
-              << query_ref_reconstruct_time << " / " << query_desplit_time << " sec" << std::endl;
-    std::cout << "Auto query full fine decode baseline: "
-              << low_time_taken_decompress_sz + time_taken_decompress_sz << " sec" << std::endl;
-    std::cout << "Auto query full fine depreprocess baseline: "
-              << (low_time_taken_decompress - low_time_taken_decompress_sz) +
-                     (time_taken_decompress - time_taken_decompress_sz)
+    const double query_end_to_end_decompress_time =
+        sz_time_taken_decompress + query_low_decode_time + query_high_decode_time +
+        query_low_depre_time + query_high_depre_time +
+        query_ref_reconstruct_time + query_desplit_time;
+    std::cout << "Auto query decompress breakdown: "
+              << "base decomp " << sz_time_taken_decompress
+              << ", low decode " << query_low_decode_time
+              << ", low deprocess " << query_low_depre_time
+              << ", low merge " << query_ref_reconstruct_time
+              << ", high decode " << query_high_decode_time
+              << ", high deprocess " << query_high_depre_time
+              << ", high merge " << query_desplit_time
               << " sec" << std::endl;
-    std::cout << "Auto query old high-only depreprocess time: "
-              << query_old_high_depre_time << " sec" << std::endl;
+    std::cout << "Auto query end-to-end decompress time: "
+              << query_end_to_end_decompress_time << " sec" << std::endl;
     std::cout << "Auto query decoded symbols low/high: "
               << queryLowSymbols << " / " << queryHighSymbols << std::endl;
-    std::cout << "Auto query marker vs full-decode max abs diff: "
-              << query_max_abs_diff << std::endl;
-    std::cout << "Auto query final ROI max abs diff: "
-              << query_final_max_abs_diff << std::endl;
+    if (full_validate) {
+        std::cout << "Auto query marker vs full-decode max abs diff: "
+                  << query_max_abs_diff << std::endl;
+        std::cout << "Auto query final ROI max abs diff: "
+                  << query_final_max_abs_diff << std::endl;
+    }
 
     for (int i = 0; i < 7; ++i) {
         delete[] query_low_ra_deData[i];
@@ -1633,36 +1684,62 @@ int run_typed(int argc, char* argv[])
     auto roi_eval_end = std::chrono::high_resolution_clock::now();
     double roi_eval_time = std::chrono::duration_cast<std::chrono::nanoseconds>(roi_eval_end - roi_eval_start).count() * 1e-9;
 
-    auto reconstructed_full_start = std::chrono::high_resolution_clock::now();
-    T* reconstructed_full_data = new T[full_dim_z * full_dim_y * full_dim_x];
-    T* all_sub_blocks[8] = {
-        reconstructed_sub_0,          // vs ori sub_block_0
-        de_sub_block[0],      // sub_block_1
-        de_sub_block[1],      // sub_block_2
-        de_sub_block[2],      // sub_block_3
-        de_sub_block[3],      // sub_block_4
-        de_sub_block[4],      // sub_block_5
-        de_sub_block[5],      // sub_block_6
-        de_sub_block[6]       // sub_block_7
-    };
-    merge_sub_blocks_to_full(all_sub_blocks, reconstructed_full_data, dim_x, dim_y, dim_z);
-    auto reconstructed_full_end = std::chrono::high_resolution_clock::now();
-    double time_taken_reconstructed_full = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_full_end - reconstructed_full_start).count() * 1e-9;
-    double global_decompress_time = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_full_end - global_decompress_start).count() * 1e-9 - roi_eval_time;
-    // std::cout << "Time taken by reconstructed_full is: " << std::fixed << std::setprecision(5)
-    //           << time_taken_reconstructed_full << " sec" << std::endl;
+    double time_taken_reconstructed_full = 0.0;
+    double global_decompress_time = query_end_to_end_decompress_time;
+    if (full_validate) {
+        auto reconstructed_full_start = std::chrono::high_resolution_clock::now();
+        T* reconstructed_full_data = new T[full_dim_z * full_dim_y * full_dim_x];
+        T* all_sub_blocks[8] = {
+            reconstructed_sub_0,          // vs ori sub_block_0
+            de_sub_block[0],      // sub_block_1
+            de_sub_block[1],      // sub_block_2
+            de_sub_block[2],      // sub_block_3
+            de_sub_block[3],      // sub_block_4
+            de_sub_block[4],      // sub_block_5
+            de_sub_block[5],      // sub_block_6
+            de_sub_block[6]       // sub_block_7
+        };
+        merge_sub_blocks_to_full(all_sub_blocks, reconstructed_full_data, dim_x, dim_y, dim_z);
+        auto reconstructed_full_end = std::chrono::high_resolution_clock::now();
+        time_taken_reconstructed_full = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_full_end - reconstructed_full_start).count() * 1e-9;
+        global_decompress_time = std::chrono::duration_cast<std::chrono::nanoseconds>(reconstructed_full_end - global_decompress_start).count() * 1e-9 - roi_eval_time;
+        // std::cout << "Time taken by reconstructed_full is: " << std::fixed << std::setprecision(5)
+        //           << time_taken_reconstructed_full << " sec" << std::endl;
 
-    // writeBinaryData("ours.raw", reconstructed_full_data, full_dim_z * full_dim_y * full_dim_x);
+        // writeBinaryData("ours.raw", reconstructed_full_data, full_dim_z * full_dim_y * full_dim_x);
 
-    double mse_full = 0.0;
-    for (size_t i = 0; i < full_dim_z * full_dim_y * full_dim_x; ++i) {
-        double diff = full_data[i] - reconstructed_full_data[i];
-        mse_full += diff * diff;
+        double mse_full = 0.0;
+        for (size_t i = 0; i < full_dim_z * full_dim_y * full_dim_x; ++i) {
+            double diff = full_data[i] - reconstructed_full_data[i];
+            mse_full += diff * diff;
+        }
+        mse_full /= (full_dim_z * full_dim_y * full_dim_x);
+        double range_full = computeRange(full_data, full_dim_z * full_dim_y * full_dim_x);
+        double psnr_full = 20 * log10(range_full) - 10 * log10(mse_full);
+        std::cout << "Global PSNR: " << psnr_full << std::endl;
+        delete[] reconstructed_full_data;
     }
-    mse_full /= (full_dim_z * full_dim_y * full_dim_x);
-    double range_full = computeRange(full_data, full_dim_z * full_dim_y * full_dim_x);
-    double psnr_full = 20 * log10(range_full) - 10 * log10(mse_full);
-    std::cout << "Global PSNR: " << psnr_full << std::endl;
+
+    const double full_low_deprocess_time = low_time_taken_decompress - low_time_taken_decompress_sz;
+    const double full_high_deprocess_time = time_taken_decompress - time_taken_decompress_sz;
+    const double full_decompress_breakdown_sum =
+        sz_time_taken_decompress + low_time_taken_decompress_sz +
+        full_low_deprocess_time + time_taken_reconstructed_low_decompress +
+        time_taken_decompress_sz + full_high_deprocess_time +
+        time_taken_reconstructed_full;
+    if (full_validate) {
+        std::cout << "Full decompress breakdown: "
+                  << "base decomp " << sz_time_taken_decompress
+                  << ", low decode " << low_time_taken_decompress_sz
+                  << ", low deprocess " << full_low_deprocess_time
+                  << ", low merge " << time_taken_reconstructed_low_decompress
+                  << ", high decode " << time_taken_decompress_sz
+                  << ", high deprocess " << full_high_deprocess_time
+                  << ", high merge " << time_taken_reconstructed_full
+                  << " sec" << std::endl;
+        std::cout << "Full decompress breakdown sum: "
+                  << full_decompress_breakdown_sum << " sec" << std::endl;
+    }
 
     // //Write out the reconstructed sub-blocks.
     // std::string de_sub_block_paths[7] = {
@@ -1686,7 +1763,10 @@ int run_typed(int argc, char* argv[])
               << sz_time_taken_split + sz_time_taken + low_time_taken + time_taken_reconstructed_low + time_taken << " sec" << std::endl;
     
     std::cout << "decompress time is: " << std::fixed << std::setprecision(5)
-              << sz_time_taken_decompress + low_time_taken_decompress + time_taken_reconstructed_low_decompress + time_taken_decompress + time_taken_reconstructed_full << " sec" << std::endl;
+              << (full_validate
+                  ? sz_time_taken_decompress + low_time_taken_decompress + time_taken_reconstructed_low_decompress + time_taken_decompress + time_taken_reconstructed_full
+                  : query_end_to_end_decompress_time)
+              << " sec" << std::endl;
 
     std::cout << "global compress time is: " << std::fixed << std::setprecision(5)
               << global_compress_time << " sec" << std::endl;
@@ -1699,6 +1779,15 @@ int run_typed(int argc, char* argv[])
     delete[] decompressed_data;
     for (int i = 0; i < 8; ++i)
         delete[] sub_block_data[i];
+    for (int i = 0; i < 8; ++i)
+        delete[] low_block_data[i];
+    for (int i = 0; i < 7; ++i)
+    {
+        delete[] low_diff_data[i];
+        delete[] low_deData[i];
+        delete[] low_de_sub_block[i];
+    }
+    delete[] reconstructed_sub_0;
     for (int i = 0; i < 7; ++i)
     {
         delete[] diff_data[i];
@@ -1713,7 +1802,7 @@ int main(int argc, char* argv[])
 {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <error_bound> <raw_file> <cube_dim> <-f|-d> [x0 y0 z0 x1 y1 z1]"
+                  << " <error_bound> <raw_file> <cube_dim> <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
                   << std::endl;
         return 1;
     }
