@@ -6,8 +6,10 @@
 #include <chrono>
 #include <iomanip>
 #include <cfloat>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <set>
 #include "SZ3/encoder/HuffmanEncoder.hpp"
 #include "SZ3/lossless/Lossless_zstd.hpp"
@@ -15,29 +17,43 @@
 #include "SZ3/utils/MemoryUtil.hpp"
 #include "sz.hpp"
 
-const int full_dim_z = 512;
-const int full_dim_y = 512;
-const int full_dim_x = 512;
-const int dim_z = 256;
-const int dim_y = 256;
-const int dim_x = 256;
-const int low_dim_z = 128;
-const int low_dim_y = 128;
-const int low_dim_x = 128;
-const int roi_full_dim = 64;
-const int roi_high_dim = roi_full_dim / 2;
-const int roi_low_dim = roi_high_dim / 2;
-const size_t marker_table_bytes_per_stream = 512 * sizeof(uint64_t);
-// const int full_dim_z = 1024;
-// const int full_dim_y = 1024;
-// const int full_dim_x = 1024;
-// const int dim_z = 512;
-// const int dim_y = 512;
-// const int dim_x = 512;
-// const int low_dim_z = 256;
-// const int low_dim_y = 256;
-// const int low_dim_x = 256;
-void merge_sub_blocks_to_full(float* sub_blocks[8], float* full_data, int sub_dim_x, int sub_dim_y, int sub_dim_z) {
+int full_dim_z = 512;
+int full_dim_y = 512;
+int full_dim_x = 512;
+int dim_z = 256;
+int dim_y = 256;
+int dim_x = 256;
+int low_dim_z = 128;
+int low_dim_y = 128;
+int low_dim_x = 128;
+constexpr int roi_full_dim = 64;
+constexpr int roi_high_dim = 32;
+constexpr int roi_low_dim = 16;
+
+static void set_cube_dims(int full_dim)
+{
+    full_dim_x = full_dim_y = full_dim_z = full_dim;
+    dim_x = dim_y = dim_z = full_dim / 2;
+    low_dim_x = low_dim_y = low_dim_z = full_dim / 4;
+}
+
+static size_t marker_table_bytes_per_stream(size_t block_dim, size_t chunk_dim)
+{
+    const size_t chunks_per_dim = block_dim / chunk_dim;
+    return chunks_per_dim * chunks_per_dim * chunks_per_dim * sizeof(uint64_t);
+}
+
+static size_t file_size_bytes(const std::string& filepath)
+{
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return static_cast<size_t>(file.tellg());
+}
+
+template <typename T>
+void merge_sub_blocks_to_full(T* sub_blocks[8], T* full_data, int sub_dim_x, int sub_dim_y, int sub_dim_z) {
     int full_x = sub_dim_x * 2;
     int full_y = sub_dim_y * 2;
     int full_z = sub_dim_z * 2;
@@ -57,9 +73,10 @@ void merge_sub_blocks_to_full(float* sub_blocks[8], float* full_data, int sub_di
     }
 }
 
-double computeRange(const float* data, size_t num_elements) {
-    double high = -FLT_MAX;
-    double low = FLT_MAX;
+template <typename T>
+double computeRange(const T* data, size_t num_elements) {
+    double high = -std::numeric_limits<double>::max();
+    double low = std::numeric_limits<double>::max();
     for (size_t i = 0; i < num_elements; i++) {
         if (data[i] > high)
             high = data[i];
@@ -71,7 +88,8 @@ double computeRange(const float* data, size_t num_elements) {
 }
 
 
-void slice_full_data(const float* full_data, float* sub_block_data[8],int dim_x, int dim_y, int dim_z) {
+template <typename T>
+void slice_full_data(const T* full_data, T* sub_block_data[8],int dim_x, int dim_y, int dim_z) {
     #pragma omp parallel for 
     for (int z = 0; z < dim_z; ++z) {
         for (int y = 0; y < dim_y; ++y) {
@@ -87,100 +105,105 @@ void slice_full_data(const float* full_data, float* sub_block_data[8],int dim_x,
     }
 }
 
-static inline float cubic_line_pred(float a, float b, float c, float d)
+template <typename T>
+static inline T cubic_line_pred(T a, T b, T c, T d)
 {
     return -(1.0f / 16.0f) * a + (9.0f / 16.0f) * b +
            (9.0f / 16.0f) * c - (1.0f / 16.0f) * d;
 }
 
-static inline float cubic_line_var(float a, float b, float c, float d)
+template <typename T>
+static inline T cubic_line_var(T a, T b, T c, T d)
 {
-    constexpr float eps = 1e-12f;
-    const float c0 = a - 2.0f * b + c;
-    const float c1 = b - 2.0f * c + d;
+    constexpr T eps = 1e-12f;
+    const T c0 = a - 2.0f * b + c;
+    const T c1 = b - 2.0f * c + d;
     return 0.5f * (c0 * c0 + c1 * c1) + eps;
 }
 
-static inline float blend2(float p0, float v0, float p1, float v1)
+template <typename T>
+static inline T blend2(T p0, T v0, T p1, T v1)
 {
     return (p0 * v1 + p1 * v0) / (v0 + v1);
 }
 
-static inline float blend4(float p0, float v0, float p1, float v1,
-                           float p2, float v2, float p3, float v3)
+template <typename T>
+static inline T blend4(T p0, T v0, T p1, T v1,
+                           T p2, T v2, T p3, T v3)
 {
-    const float w0 = 1.0f / v0;
-    const float w1 = 1.0f / v1;
-    const float w2 = 1.0f / v2;
-    const float w3 = 1.0f / v3;
+    const T w0 = 1.0f / v0;
+    const T w1 = 1.0f / v1;
+    const T w2 = 1.0f / v2;
+    const T w3 = 1.0f / v3;
     return (w0 * p0 + w1 * p1 + w2 * p2 + w3 * p3) / (w0 + w1 + w2 + w3);
 }
 
-static inline float predict_dynamic_lines(int block, const float* ref, int idx,
+template <typename T>
+static inline T predict_dynamic_lines(int block, const T* ref, int idx,
                                           int dim_x, int dim_xy)
 {
     if (block == 2) {
-        const float p0 = cubic_line_pred(ref[idx - dim_x - 1], ref[idx], ref[idx + dim_x + 1],
+        const T p0 = cubic_line_pred(ref[idx - dim_x - 1], ref[idx], ref[idx + dim_x + 1],
                                          ref[idx + 2 * dim_x + 2]);
-        const float v0 = cubic_line_var(ref[idx - dim_x - 1], ref[idx], ref[idx + dim_x + 1],
+        const T v0 = cubic_line_var(ref[idx - dim_x - 1], ref[idx], ref[idx + dim_x + 1],
                                         ref[idx + 2 * dim_x + 2]);
-        const float p1 = cubic_line_pred(ref[idx - dim_x + 2], ref[idx + 1], ref[idx + dim_x],
+        const T p1 = cubic_line_pred(ref[idx - dim_x + 2], ref[idx + 1], ref[idx + dim_x],
                                          ref[idx + 2 * dim_x - 1]);
-        const float v1 = cubic_line_var(ref[idx - dim_x + 2], ref[idx + 1], ref[idx + dim_x],
+        const T v1 = cubic_line_var(ref[idx - dim_x + 2], ref[idx + 1], ref[idx + dim_x],
                                         ref[idx + 2 * dim_x - 1]);
         return blend2(p0, v0, p1, v1);
     }
 
     if (block == 4) {
-        const float p0 = cubic_line_pred(ref[idx - dim_xy - 1], ref[idx], ref[idx + dim_xy + 1],
+        const T p0 = cubic_line_pred(ref[idx - dim_xy - 1], ref[idx], ref[idx + dim_xy + 1],
                                          ref[idx + 2 * dim_xy + 2]);
-        const float v0 = cubic_line_var(ref[idx - dim_xy - 1], ref[idx], ref[idx + dim_xy + 1],
+        const T v0 = cubic_line_var(ref[idx - dim_xy - 1], ref[idx], ref[idx + dim_xy + 1],
                                         ref[idx + 2 * dim_xy + 2]);
-        const float p1 = cubic_line_pred(ref[idx - dim_xy + 2], ref[idx + 1], ref[idx + dim_xy],
+        const T p1 = cubic_line_pred(ref[idx - dim_xy + 2], ref[idx + 1], ref[idx + dim_xy],
                                          ref[idx + 2 * dim_xy - 1]);
-        const float v1 = cubic_line_var(ref[idx - dim_xy + 2], ref[idx + 1], ref[idx + dim_xy],
+        const T v1 = cubic_line_var(ref[idx - dim_xy + 2], ref[idx + 1], ref[idx + dim_xy],
                                         ref[idx + 2 * dim_xy - 1]);
         return blend2(p0, v0, p1, v1);
     }
 
     if (block == 5) {
-        const float p0 = cubic_line_pred(ref[idx - dim_xy - dim_x], ref[idx],
+        const T p0 = cubic_line_pred(ref[idx - dim_xy - dim_x], ref[idx],
                                          ref[idx + dim_xy + dim_x],
                                          ref[idx + 2 * dim_xy + 2 * dim_x]);
-        const float v0 = cubic_line_var(ref[idx - dim_xy - dim_x], ref[idx],
+        const T v0 = cubic_line_var(ref[idx - dim_xy - dim_x], ref[idx],
                                         ref[idx + dim_xy + dim_x],
                                         ref[idx + 2 * dim_xy + 2 * dim_x]);
-        const float p1 = cubic_line_pred(ref[idx - dim_xy + 2 * dim_x], ref[idx + dim_x],
+        const T p1 = cubic_line_pred(ref[idx - dim_xy + 2 * dim_x], ref[idx + dim_x],
                                          ref[idx + dim_xy],
                                          ref[idx + 2 * dim_xy - dim_x]);
-        const float v1 = cubic_line_var(ref[idx - dim_xy + 2 * dim_x], ref[idx + dim_x],
+        const T v1 = cubic_line_var(ref[idx - dim_xy + 2 * dim_x], ref[idx + dim_x],
                                         ref[idx + dim_xy],
                                         ref[idx + 2 * dim_xy - dim_x]);
         return blend2(p0, v0, p1, v1);
     }
 
-    const float p0 = cubic_line_pred(ref[idx - dim_xy - dim_x - 1], ref[idx],
+    const T p0 = cubic_line_pred(ref[idx - dim_xy - dim_x - 1], ref[idx],
                                      ref[idx + dim_xy + dim_x + 1],
                                      ref[idx + 2 * dim_xy + 2 * dim_x + 2]);
-    const float v0 = cubic_line_var(ref[idx - dim_xy - dim_x - 1], ref[idx],
+    const T v0 = cubic_line_var(ref[idx - dim_xy - dim_x - 1], ref[idx],
                                     ref[idx + dim_xy + dim_x + 1],
                                     ref[idx + 2 * dim_xy + 2 * dim_x + 2]);
-    const float p1 = cubic_line_pred(ref[idx - dim_xy - dim_x + 2], ref[idx + 1],
+    const T p1 = cubic_line_pred(ref[idx - dim_xy - dim_x + 2], ref[idx + 1],
                                      ref[idx + dim_xy + dim_x],
                                      ref[idx + 2 * dim_xy + 2 * dim_x - 1]);
-    const float v1 = cubic_line_var(ref[idx - dim_xy - dim_x + 2], ref[idx + 1],
+    const T v1 = cubic_line_var(ref[idx - dim_xy - dim_x + 2], ref[idx + 1],
                                     ref[idx + dim_xy + dim_x],
                                     ref[idx + 2 * dim_xy + 2 * dim_x - 1]);
-    const float p2 = cubic_line_pred(ref[idx - dim_xy + 2 * dim_x - 1], ref[idx + dim_x],
+    const T p2 = cubic_line_pred(ref[idx - dim_xy + 2 * dim_x - 1], ref[idx + dim_x],
                                      ref[idx + dim_xy + 1],
                                      ref[idx + 2 * dim_xy - dim_x + 2]);
-    const float v2 = cubic_line_var(ref[idx - dim_xy + 2 * dim_x - 1], ref[idx + dim_x],
+    const T v2 = cubic_line_var(ref[idx - dim_xy + 2 * dim_x - 1], ref[idx + dim_x],
                                     ref[idx + dim_xy + 1],
                                     ref[idx + 2 * dim_xy - dim_x + 2]);
-    const float p3 = cubic_line_pred(ref[idx + 2 * dim_xy - dim_x - 1], ref[idx + dim_xy],
+    const T p3 = cubic_line_pred(ref[idx + 2 * dim_xy - dim_x - 1], ref[idx + dim_xy],
                                      ref[idx + dim_x + 1],
                                      ref[idx - dim_xy + 2 * dim_x + 2]);
-    const float v3 = cubic_line_var(ref[idx + 2 * dim_xy - dim_x - 1], ref[idx + dim_xy],
+    const T v3 = cubic_line_var(ref[idx + 2 * dim_xy - dim_x - 1], ref[idx + dim_xy],
                                     ref[idx + dim_x + 1],
                                     ref[idx - dim_xy + 2 * dim_x + 2]);
     return blend4(p0, v0, p1, v1, p2, v2, p3, v3);
@@ -191,7 +214,8 @@ static inline float predict_dynamic_lines(int block, const float* ref, int idx,
 // block index: 0 corresponds to "001", 1 to "010", 2 to "011", 3 to "100",
 // 4 to "101", 5 to "110", 6 to "111"
 //---------------------------------------------------------------------
-void preprocess_block(int block, const float* sub_block, const float* ref, float* diff,
+template <typename T>
+void preprocess_block(int block, const T* sub_block, const T* ref, T* diff,
                         int dim_x, int dim_y, int dim_z)
 {
     int dim_xy= dim_x * dim_y;
@@ -333,7 +357,8 @@ void preprocess_block(int block, const float* sub_block, const float* ref, float
 //---------------------------------------------------------------------
 // De-preprocessing: Reconstruct de_sub = deData + reference
 //---------------------------------------------------------------------
-void depreprocess_block(int block, const float* deData, const float* ref, float* de_sub,
+template <typename T>
+void depreprocess_block(int block, const T* deData, const T* ref, T* de_sub,
                           int dim_x, int dim_y, int dim_z,
                           int roi_x = -1, int roi_y = -1, int roi_z = -1,
                           int start_x = 0, int start_y = 0, int start_z = 0)
@@ -479,44 +504,55 @@ void depreprocess_block(int block, const float* deData, const float* ref, float*
 //---------------------------------------------------------------------
 // SZ compression/decompression and file I/O routines (unchanged)
 //---------------------------------------------------------------------
-char* SZ_compress(float* oriData, size_t blksize_x, size_t blksize_y, size_t blksize_z, double eb, size_t& outSize)
+template <typename T>
+char* SZ_compress(T* oriData, size_t blksize_x, size_t blksize_y, size_t blksize_z,
+                  size_t marker_chunk_dim, double eb, size_t& outSize)
 {
+    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, marker_chunk_dim);
     SZ3::Config conf(blksize_z, blksize_y, blksize_x);
     conf.cmprAlgo = SZ3::ALGO_NOPRED;
     conf.errorBoundMode = SZ3::EB_ABS;
     conf.absErrorBound = eb;
-    char* compressedData = SZ_compress<float>(conf, oriData, outSize);
+    char* compressedData = SZ_compress<T>(conf, oriData, outSize);
+    SZ3::HuffmanEncoder<int>::clear_forced_marker();
     return compressedData;
 }
 
-char* SZ_compress4De(float* oriData, size_t blksize_x, size_t blksize_y, size_t blksize_z, double eb, size_t& outSize)
+template <typename T>
+char* SZ_compress4De(T* oriData, size_t blksize_x, size_t blksize_y, size_t blksize_z, double eb, size_t& outSize)
 {
     SZ3::Config conf(blksize_z, blksize_y, blksize_x);
     conf.cmprAlgo = SZ3::ALGO_INTERP_LORENZO;
     conf.errorBoundMode = SZ3::EB_ABS;
     conf.absErrorBound = eb;
-    char* compressedData = SZ_compress<float>(conf, oriData, outSize);
+    char* compressedData = SZ_compress<T>(conf, oriData, outSize);
     // Note: Returning original data (as in your original code)
     return compressedData;
 }
 
-float* SZ_decompress4De(char* compressedData, size_t outSize, size_t blksize_x, size_t blksize_y, size_t blksize_z)
+template <typename T>
+T* SZ_decompress4De(char* compressedData, size_t outSize, size_t blksize_x, size_t blksize_y, size_t blksize_z)
 {
     SZ3::Config conf(blksize_z, blksize_y, blksize_x);
     conf.cmprAlgo = SZ3::ALGO_INTERP_LORENZO;
     conf.errorBoundMode = SZ3::EB_ABS;
-    float* deData = new float[blksize_x * blksize_y * blksize_z];
-    SZ_decompress<float>(conf, compressedData, outSize, deData);
+    T* deData = new T[blksize_x * blksize_y * blksize_z];
+    SZ_decompress<T>(conf, compressedData, outSize, deData);
     return deData;
 }
 
-float* SZ_decompress_separated(char* compressedData, size_t outSize, size_t blksize_x, size_t blksize_y, size_t blksize_z)
+template <typename T>
+T* SZ_decompress_separated(char* compressedData, size_t outSize,
+                           size_t blksize_x, size_t blksize_y, size_t blksize_z,
+                           size_t marker_chunk_dim)
 {
+    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, marker_chunk_dim);
     SZ3::Config conf(blksize_z, blksize_y, blksize_x);
     conf.cmprAlgo = SZ3::ALGO_NOPRED;
     conf.errorBoundMode = SZ3::EB_ABS;
-    float* deData = new float[blksize_x * blksize_y * blksize_z];
-    SZ_decompress<float>(conf, compressedData, outSize, deData);
+    T* deData = new T[blksize_x * blksize_y * blksize_z];
+    SZ_decompress<T>(conf, compressedData, outSize, deData);
+    SZ3::HuffmanEncoder<int>::clear_forced_marker();
     return deData;
 }
 
@@ -772,11 +808,13 @@ std::string blocks_to_string(const std::vector<BlockAccessPlan>& plans)
     return s.empty() ? "(none)" : s;
 }
 
-float* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
+template <typename T>
+T* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
                                            size_t blksize_x, size_t blksize_y, size_t blksize_z,
                                            size_t chunk_dim, const std::vector<size_t>& rowMajorChunks,
                                            size_t& decodedSymbols, size_t& unpredZeros)
 {
+    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, chunk_dim);
     SZ3::uchar* buffer = nullptr;
     size_t bufferSize = 0;
     SZ3::Lossless_zstd lossless;
@@ -788,6 +826,7 @@ float* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
         std::cerr << "Marked chunk decode expects an ALGO_NOPRED stream with "
                   << expected_num << " values, got algo " << conf.cmprAlgo
                   << " and num " << conf.num << std::endl;
+        SZ3::HuffmanEncoder<int>::clear_forced_marker();
         return nullptr;
     }
     const SZ3::uchar* cmp_pos = reinterpret_cast<const SZ3::uchar*>(compressedData) + conf.size_est();
@@ -795,7 +834,7 @@ float* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
 
     const SZ3::uchar* buffer_pos = buffer;
     size_t remaining_length = bufferSize;
-    SZ3::LinearQuantizer<float> quantizer;
+    SZ3::LinearQuantizer<T> quantizer;
     quantizer.load(buffer_pos, remaining_length);
 
     SZ3::HuffmanEncoder<int> encoder;
@@ -805,7 +844,7 @@ float* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
     std::vector<int> quant_inds = encoder.decode_marked_chunks(buffer_pos, quant_inds_size, rowMajorChunks);
     encoder.postprocess_decode();
 
-    float* deData = new float[blksize_x * blksize_y * blksize_z]();
+    T* deData = new T[blksize_x * blksize_y * blksize_z];
     const size_t chunks_per_dim = blksize_x / chunk_dim;
     const size_t chunk_volume = chunk_dim * chunk_dim * chunk_dim;
     decodedSymbols = quant_inds.size();
@@ -833,10 +872,12 @@ float* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
     }
 
     free(buffer);
+    SZ3::HuffmanEncoder<int>::clear_forced_marker();
     return deData;
 }
 
-bool readBinaryData(const std::string& filepath, float* data, size_t dataSize)
+template <typename T>
+bool readBinaryData(const std::string& filepath, T* data, size_t dataSize)
 {
     std::ifstream file(filepath, std::ios::binary);
     if (!file)
@@ -844,7 +885,7 @@ bool readBinaryData(const std::string& filepath, float* data, size_t dataSize)
         std::cerr << "Failed to open file for reading: " << filepath << std::endl;
         return false;
     }
-    file.read(reinterpret_cast<char*>(data), dataSize * sizeof(float));
+    file.read(reinterpret_cast<char*>(data), dataSize * sizeof(T));
     if (!file)
     {
         std::cerr << "Failed to read data from file: " << filepath << std::endl;
@@ -854,7 +895,8 @@ bool readBinaryData(const std::string& filepath, float* data, size_t dataSize)
     return true;
 }
 
-bool writeBinaryData(const std::string& filepath, const float* data, size_t dataSize)
+template <typename T>
+bool writeBinaryData(const std::string& filepath, const T* data, size_t dataSize)
 {
     std::ofstream file(filepath, std::ios::binary);
     if (!file)
@@ -862,7 +904,7 @@ bool writeBinaryData(const std::string& filepath, const float* data, size_t data
         std::cerr << "Failed to open file for writing: " << filepath << std::endl;
         return false;
     }
-    file.write(reinterpret_cast<const char*>(data), dataSize * sizeof(float));
+    file.write(reinterpret_cast<const char*>(data), dataSize * sizeof(T));
     if (!file)
     {
         std::cerr << "Failed to write data to file: " << filepath << std::endl;
@@ -875,29 +917,64 @@ bool writeBinaryData(const std::string& filepath, const float* data, size_t data
 //---------------------------------------------------------------------
 // Main routine
 //---------------------------------------------------------------------
-int main(int argc, char* argv[])
+template <typename T>
+int run_typed(int argc, char* argv[])
 {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <error_bound> [x0 y0 z0 x1 y1 z1]" << std::endl;
+    if (argc < 5) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <error_bound> <raw_file> <cube_dim> <-f|-d> [x0 y0 z0 x1 y1 z1]"
+                  << std::endl;
         return 1;
     }
-    QueryBox query = make_query(0, 0, 0, roi_full_dim - 1, roi_full_dim - 1, roi_full_dim - 1);
-    if (argc >= 8) {
-        query = make_query(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]),
-                           atoi(argv[5]), atoi(argv[6]), atoi(argv[7]));
+    const double eb = atof(argv[1]);
+    const std::string full_file_path = argv[2];
+    const int full_dim = atoi(argv[3]);
+    if (full_dim <= 0 || full_dim % 4 != 0) {
+        std::cerr << "cube_dim must be positive and divisible by 4, got " << argv[3] << std::endl;
+        return 1;
     }
-    std::cout << "Random-access Huffman marker test: low 128^3 uses 16^3 markers, "
-              << "high 256^3 uses 32^3 markers." << std::endl;
+    if ((full_dim / 2) % roi_high_dim != 0 || (full_dim / 4) % roi_low_dim != 0) {
+        std::cerr << "cube_dim " << full_dim
+                  << " is incompatible with high " << roi_high_dim << "^3 and low "
+                  << roi_low_dim << "^3 marker chunks." << std::endl;
+        return 1;
+    }
+    set_cube_dims(full_dim);
+
+    const size_t full_size = static_cast<size_t>(full_dim_z) * full_dim_y * full_dim_x;
+    const size_t expected_bytes = full_size * sizeof(T);
+    const size_t actual_bytes = file_size_bytes(full_file_path);
+    if (actual_bytes == std::numeric_limits<size_t>::max()) {
+        std::cerr << "Failed to open file for size check: " << full_file_path << std::endl;
+        return 1;
+    }
+    if (actual_bytes != expected_bytes) {
+        std::cerr << "Input file size mismatch for "
+                  << (sizeof(T) == sizeof(float) ? "float" : "double")
+                  << ": expected " << expected_bytes << " bytes for "
+                  << full_dim << "^3, got " << actual_bytes << " bytes." << std::endl;
+        return 1;
+    }
+
+    const int default_roi_dim = std::min(roi_full_dim, full_dim);
+    QueryBox query = make_query(0, 0, 0, default_roi_dim - 1, default_roi_dim - 1, default_roi_dim - 1);
+    if (argc >= 11) {
+        query = make_query(atoi(argv[5]), atoi(argv[6]), atoi(argv[7]),
+                           atoi(argv[8]), atoi(argv[9]), atoi(argv[10]));
+    } else if (argc != 5) {
+        std::cerr << "ROI query must provide exactly six integers: x0 y0 z0 x1 y1 z1" << std::endl;
+        return 1;
+    }
+    std::cout << "Random-access Huffman marker test: low " << low_dim_x << "^3 uses "
+              << roi_low_dim << "^3 markers, high " << dim_x << "^3 uses "
+              << roi_high_dim << "^3 markers." << std::endl;
+    std::cout << "Input: " << full_file_path << ", dim: " << full_dim
+              << ", type: " << (sizeof(T) == sizeof(float) ? "float" : "double") << std::endl;
     std::cout << "Query [" << query.x.begin << "," << query.x.end << "] x ["
               << query.y.begin << "," << query.y.end << "] x ["
               << query.z.begin << "," << query.z.end << "] "
               << (query.is_slice ? "(slice)" : "(box)") << std::endl;
-
-    std::string full_file_path = "/home/daoce.wang/data/baryon_density.raw";
-    // std::string full_file_path = "/N/u/daocwang/BigRed200/data/magnetic_reconnection_512x512x512_float32.raw";
-    // std::string full_file_path = "/N/u/daocwang/BigRed200/data/miranda_1024x1024x1024_float32.raw";
-    size_t full_size = full_dim_z * full_dim_y * full_dim_x;
-    float* full_data = new float[full_size];
+    T* full_data = new T[full_size];
     if (!readBinaryData(full_file_path, full_data, full_size))
     {
         delete[] full_data;
@@ -906,18 +983,18 @@ int main(int argc, char* argv[])
 
     auto split_start = std::chrono::high_resolution_clock::now();
     // Allocate 8 sub-blocks (each 256^3)
-    float* sub_block_data[8];
+    T* sub_block_data[8];
     #pragma omp parallel for 
     for (int i = 0; i < 8; ++i)
-        sub_block_data[i] = new float[dim_z * dim_x * dim_y];
+        sub_block_data[i] = new T[dim_z * dim_x * dim_y];
 
     // Slice full_data into 8 sub-blocks using bit masking.
     slice_full_data(full_data, sub_block_data,full_dim_x,full_dim_y,full_dim_z);
 
-    float* low_block_data[8];
+    T* low_block_data[8];
     #pragma omp parallel for 
     for (int i = 0; i < 8; ++i)
-        low_block_data[i] = new float[low_dim_z * low_dim_y * low_dim_x];
+        low_block_data[i] = new T[low_dim_z * low_dim_y * low_dim_x];
 
     slice_full_data(sub_block_data[0], low_block_data,dim_x,dim_y,dim_z);
 
@@ -928,8 +1005,6 @@ int main(int argc, char* argv[])
 
     // Use sub_block_data[0] as the reference (sz_out_data)
     // and sub_block_data[1] ... sub_block_data[7] as the seven data blocks.
-    double eb = atof(argv[1]);
-    
     size_t allSize = 0;
     size_t szcompressedSize;
     auto sz_start = std::chrono::high_resolution_clock::now();
@@ -941,20 +1016,20 @@ int main(int argc, char* argv[])
     // std::cout << "Time taken by sz compression is: " << std::fixed << std::setprecision(5)
     //           << sz_time_taken << " sec" << std::endl;
 
-    float* decompressed_data = nullptr;
+    T* decompressed_data = nullptr;
     double sz_time_taken_decompress = 0.0;
 
     char* low_comp[7];
-    float* low_diff_data[7];
-    float* low_deData[7];
-    float* low_de_sub_block[7];
+    T* low_diff_data[7];
+    T* low_deData[7];
+    T* low_de_sub_block[7];
     size_t low_compressedSize[7];
     #pragma omp parallel for 
     for (int i = 0; i < 7; ++i)
     {
-        low_diff_data[i]    = new float[low_dim_z * low_dim_y * low_dim_x];
-        low_deData[i]       = new float[low_dim_z * low_dim_y * low_dim_x];
-        low_de_sub_block[i] = new float[low_dim_z * low_dim_y * low_dim_x];
+        low_diff_data[i]    = new T[low_dim_z * low_dim_y * low_dim_x];
+        low_deData[i]       = new T[low_dim_z * low_dim_y * low_dim_x];
+        low_de_sub_block[i] = new T[low_dim_z * low_dim_y * low_dim_x];
     }
 
     auto low_start = std::chrono::high_resolution_clock::now();
@@ -964,7 +1039,8 @@ int main(int argc, char* argv[])
         // For block i, use sub_block_data[i+1] as the input.
         preprocess_block(block, low_block_data[block+1], low_block_data[0], low_diff_data[block],
                            low_dim_x, low_dim_y, low_dim_z);
-        low_comp[block] = SZ_compress(low_diff_data[block], low_dim_x, low_dim_y, low_dim_z, 2.5 * eb, low_compressedSize[block]);
+        low_comp[block] = SZ_compress(low_diff_data[block], low_dim_x, low_dim_y, low_dim_z,
+                                      roi_low_dim, 2.5 * eb, low_compressedSize[block]);
         allSize += low_compressedSize[block];
         depreprocess_block(block, low_diff_data[block], low_block_data[0], low_de_sub_block[block],
                            low_dim_x, low_dim_y, low_dim_z);
@@ -976,8 +1052,8 @@ int main(int argc, char* argv[])
     //           << low_time_taken << " sec" << std::endl;
 
     auto reconstructed_low_start = std::chrono::high_resolution_clock::now();
-    float* reconstructed_sub_0 = new float[dim_z * dim_x * dim_y];
-    float* all_low_blocks[8] = {
+    T* reconstructed_sub_0 = new T[dim_z * dim_x * dim_y];
+    T* all_low_blocks[8] = {
         low_block_data[0],          // vs ori sub_block_0
         low_de_sub_block[0],      // sub_block_1
         low_de_sub_block[1],      // sub_block_2
@@ -997,15 +1073,15 @@ int main(int argc, char* argv[])
 
     // Allocate buffers for diff, decompressed, and reconstructed data for 7 blocks.
     char* comp[7];
-    float* diff_data[7];
-    float* deData[7];
-    float* de_sub_block[7];
+    T* diff_data[7];
+    T* deData[7];
+    T* de_sub_block[7];
     size_t compressedSize[7];
     for (int i = 0; i < 7; ++i)
     {
-        diff_data[i]    = new float[dim_z * dim_x * dim_y];
-        deData[i]       = new float[dim_z * dim_x * dim_y];
-        de_sub_block[i] = new float[dim_z * dim_x * dim_y];
+        diff_data[i]    = new T[dim_z * dim_x * dim_y];
+        deData[i]       = new T[dim_z * dim_x * dim_y];
+        de_sub_block[i] = new T[dim_z * dim_x * dim_y];
     }
 
     auto start = std::chrono::high_resolution_clock::now();
@@ -1016,16 +1092,20 @@ int main(int argc, char* argv[])
         // For block i, use sub_block_data[i+1] as the input.
         preprocess_block(block, sub_block_data[block+1], reconstructed_sub_0, diff_data[block],
                            dim_x, dim_y, dim_z);
-        comp[block] = SZ_compress(diff_data[block], dim_x, dim_y, dim_z, 6.25 * eb, compressedSize[block]);
+        comp[block] = SZ_compress(diff_data[block], dim_x, dim_y, dim_z,
+                                  roi_high_dim, 6.25 * eb, compressedSize[block]);
         allSize += compressedSize[block];
         // std::cout << "outSize: " << compressedSize[block] << std::endl;
     }
-    double original_size = (double)full_dim_z * full_dim_y * full_dim_x * sizeof(float);
+    double original_size = (double)full_dim_z * full_dim_y * full_dim_x * sizeof(T);
     double CR = original_size / (double)allSize;
     std::cout << "CR: " << CR << std::endl;
     std::cout << "raw marker bytes counted before zstd: "
-              << marker_table_bytes_per_stream * 15 << " (15 streams x "
-              << marker_table_bytes_per_stream << ")" << std::endl;
+              << 7 * marker_table_bytes_per_stream(low_dim_x, roi_low_dim) +
+                     7 * marker_table_bytes_per_stream(dim_x, roi_high_dim)
+              << " (7 low streams x " << marker_table_bytes_per_stream(low_dim_x, roi_low_dim)
+              << " + 7 high streams x " << marker_table_bytes_per_stream(dim_x, roi_high_dim)
+              << ")" << std::endl;
 
     auto end = std::chrono::high_resolution_clock::now();
     double time_taken = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1e-9;
@@ -1034,7 +1114,7 @@ int main(int argc, char* argv[])
     //           << time_taken << " sec" << std::endl;
 
     auto global_decompress_start = std::chrono::high_resolution_clock::now();
-    decompressed_data = SZ_decompress4De(tmp, szcompressedSize, low_dim_x, low_dim_y, low_dim_z);
+    decompressed_data = SZ_decompress4De<T>(tmp, szcompressedSize, low_dim_x, low_dim_y, low_dim_z);
     auto sz_deend = std::chrono::high_resolution_clock::now();
     sz_time_taken_decompress = std::chrono::duration_cast<std::chrono::nanoseconds>(sz_deend - global_decompress_start).count() * 1e-9;
 
@@ -1042,7 +1122,8 @@ int main(int argc, char* argv[])
     #pragma omp parallel for 
     for (int block = 0; block < 7; ++block)
     {
-        low_deData[block] = SZ_decompress_separated(low_comp[block], low_compressedSize[block], low_dim_x, low_dim_y, low_dim_z);
+        low_deData[block] = SZ_decompress_separated<T>(low_comp[block], low_compressedSize[block],
+                                                       low_dim_x, low_dim_y, low_dim_z, roi_low_dim);
     }
     auto low_decompress_end_sz = std::chrono::high_resolution_clock::now();
     double low_time_taken_decompress_sz = std::chrono::duration_cast<std::chrono::nanoseconds>(low_decompress_end_sz - low_decompress_start).count() * 1e-9;
@@ -1070,7 +1151,8 @@ int main(int argc, char* argv[])
     #pragma omp parallel for 
     for (int block = 0; block < 7; ++block)
     {
-        deData[block] = SZ_decompress_separated(comp[block], compressedSize[block], dim_x, dim_y, dim_z);
+        deData[block] = SZ_decompress_separated<T>(comp[block], compressedSize[block],
+                                                   dim_x, dim_y, dim_z, roi_high_dim);
     }
     auto decompress_end_sz = std::chrono::high_resolution_clock::now();
     double time_taken_decompress_sz = std::chrono::duration_cast<std::chrono::nanoseconds>(decompress_end_sz - decompress_start).count() * 1e-9;
@@ -1104,15 +1186,15 @@ int main(int argc, char* argv[])
     for (const auto& p : lowPlans) queryLowChunks += p.chunks.size();
     for (const auto& p : highPlans) queryHighChunks += p.chunks.size();
 
-    float* query_low_ra_deData[7] = {};
-    float* query_low_ra_de_sub_block[7] = {};
-    float* query_high_ra_deData[7] = {};
-    float* query_high_ra_de_sub_block[7] = {};
-    float* query_old_high_de_sub_block[7] = {};
+    T* query_low_ra_deData[7] = {};
+    T* query_low_ra_de_sub_block[7] = {};
+    T* query_high_ra_deData[7] = {};
+    T* query_high_ra_de_sub_block[7] = {};
+    T* query_old_high_de_sub_block[7] = {};
     for (int i = 0; i < 7; ++i) {
-        query_low_ra_de_sub_block[i] = new float[low_dim_z * low_dim_y * low_dim_x]();
-        query_high_ra_de_sub_block[i] = new float[dim_z * dim_y * dim_x]();
-        query_old_high_de_sub_block[i] = new float[dim_z * dim_y * dim_x]();
+        query_low_ra_de_sub_block[i] = new T[low_dim_z * low_dim_y * low_dim_x];
+        query_high_ra_de_sub_block[i] = new T[dim_z * dim_y * dim_x];
+        query_old_high_de_sub_block[i] = new T[dim_z * dim_y * dim_x];
     }
 
     size_t queryLowSymbols = 0;
@@ -1123,7 +1205,7 @@ int main(int argc, char* argv[])
         const auto& plan = lowPlans[i];
         size_t decodedSymbols = 0;
         size_t unpredZeros = 0;
-        query_low_ra_deData[plan.block] = SZ_decompress_nopred_marked_chunks(
+        query_low_ra_deData[plan.block] = SZ_decompress_nopred_marked_chunks<T>(
             low_comp[plan.block], low_compressedSize[plan.block],
             low_dim_x, low_dim_y, low_dim_z, roi_low_dim, plan.chunks,
             decodedSymbols, unpredZeros);
@@ -1146,7 +1228,7 @@ int main(int argc, char* argv[])
     double query_low_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(query_low_depre_end - query_low_depre_start).count() * 1e-9;
 
     auto query_ref_reconstruct_start = std::chrono::high_resolution_clock::now();
-    float* reconstructed_sub_0_ra = new float[dim_z * dim_y * dim_x]();
+    T* reconstructed_sub_0_ra = new T[dim_z * dim_y * dim_x];
     for (const auto& region : highRefRegions) {
         for (int z = region.z.begin; z <= region.z.end; ++z) {
             for (int y = region.y.begin; y <= region.y.end; ++y) {
@@ -1173,7 +1255,7 @@ int main(int argc, char* argv[])
         const auto& plan = highPlans[i];
         size_t decodedSymbols = 0;
         size_t unpredZeros = 0;
-        query_high_ra_deData[plan.block] = SZ_decompress_nopred_marked_chunks(
+        query_high_ra_deData[plan.block] = SZ_decompress_nopred_marked_chunks<T>(
             comp[plan.block], compressedSize[plan.block],
             dim_x, dim_y, dim_z, roi_high_dim, plan.chunks,
             decodedSymbols, unpredZeros);
@@ -1212,7 +1294,7 @@ int main(int argc, char* argv[])
     const size_t queryVolume = static_cast<size_t>(query.x.end - query.x.begin + 1) *
                                static_cast<size_t>(query.y.end - query.y.begin + 1) *
                                static_cast<size_t>(query.z.end - query.z.begin + 1);
-    std::vector<float> queryResult(queryVolume);
+    std::vector<T> queryResult(queryVolume);
     size_t qout = 0;
     for (int z = query.z.begin; z <= query.z.end; ++z) {
         for (int y = query.y.begin; y <= query.y.end; ++y) {
@@ -1255,7 +1337,7 @@ int main(int argc, char* argv[])
                 const int sub_y = y / 2;
                 const int sub_x = x / 2;
                 const size_t src = sub_z * dim_y * dim_x + sub_y * dim_x + sub_x;
-                const float full_value = sub_index == 0
+                const T full_value = sub_index == 0
                     ? reconstructed_sub_0[src]
                     : de_sub_block[sub_index - 1][src];
                 query_final_max_abs_diff = std::max(query_final_max_abs_diff,
@@ -1299,13 +1381,13 @@ int main(int argc, char* argv[])
 
     if (false) {
     std::vector<size_t> roi_chunk0 = {0};
-    float* low_ra_deData[7];
-    float* low_ra_de_sub_block[7];
+    T* low_ra_deData[7];
+    T* low_ra_de_sub_block[7];
     size_t low_ra_symbols = 0;
     size_t low_ra_unpred = 0;
     for (int i = 0; i < 7; ++i) {
         low_ra_deData[i] = nullptr;
-        low_ra_de_sub_block[i] = new float[low_dim_z * low_dim_y * low_dim_x]();
+        low_ra_de_sub_block[i] = new T[low_dim_z * low_dim_y * low_dim_x]();
     }
 
     auto low_ra_decode_start = std::chrono::high_resolution_clock::now();
@@ -1313,7 +1395,7 @@ int main(int argc, char* argv[])
     for (int block = 0; block < 7; ++block) {
         size_t decodedSymbols = 0;
         size_t unpredZeros = 0;
-        low_ra_deData[block] = SZ_decompress_nopred_marked_chunks(
+        low_ra_deData[block] = SZ_decompress_nopred_marked_chunks<T>(
             low_comp[block], low_compressedSize[block],
             low_dim_x, low_dim_y, low_dim_z, roi_low_dim, roi_chunk0,
             decodedSymbols, unpredZeros);
@@ -1333,15 +1415,15 @@ int main(int argc, char* argv[])
     auto low_ra_depre_end = std::chrono::high_resolution_clock::now();
     double low_ra_depre_time = std::chrono::duration_cast<std::chrono::nanoseconds>(low_ra_depre_end - low_ra_depre_start).count() * 1e-9;
 
-    float* roi_old_de_sub_block[7];
-    float* roi_ra_deData[7];
-    float* roi_ra_de_sub_block[7];
+    T* roi_old_de_sub_block[7];
+    T* roi_ra_deData[7];
+    T* roi_ra_de_sub_block[7];
     size_t high_ra_symbols = 0;
     size_t high_ra_unpred = 0;
     for (int i = 0; i < 7; ++i) {
-        roi_old_de_sub_block[i] = new float[dim_z * dim_y * dim_x]();
+        roi_old_de_sub_block[i] = new T[dim_z * dim_y * dim_x]();
         roi_ra_deData[i] = nullptr;
-        roi_ra_de_sub_block[i] = new float[dim_z * dim_y * dim_x]();
+        roi_ra_de_sub_block[i] = new T[dim_z * dim_y * dim_x]();
     }
 
     auto roi_old_depre_start = std::chrono::high_resolution_clock::now();
@@ -1359,7 +1441,7 @@ int main(int argc, char* argv[])
     for (int block = 0; block < 7; ++block) {
         size_t decodedSymbols = 0;
         size_t unpredZeros = 0;
-        roi_ra_deData[block] = SZ_decompress_nopred_marked_chunks(
+        roi_ra_deData[block] = SZ_decompress_nopred_marked_chunks<T>(
             comp[block], compressedSize[block],
             dim_x, dim_y, dim_z, roi_high_dim, roi_chunk0,
             decodedSymbols, unpredZeros);
@@ -1430,15 +1512,15 @@ int main(int argc, char* argv[])
     const std::vector<size_t> low_slice_chunks = chunks_for_z_slice(low_dim_x, roi_low_dim, low_slice_z);
     const std::vector<size_t> high_slice_chunks = chunks_for_z_slice(dim_x, roi_high_dim, high_slice_z);
 
-    float* slice_low_ra_deData[7] = {};
-    float* slice_low_ra_de_sub_block[7] = {};
-    float* slice_high_ra_deData[7] = {};
-    float* slice_high_ra_de_sub_block[7] = {};
-    float* slice_old_high_de_sub_block[7] = {};
+    T* slice_low_ra_deData[7] = {};
+    T* slice_low_ra_de_sub_block[7] = {};
+    T* slice_high_ra_deData[7] = {};
+    T* slice_high_ra_de_sub_block[7] = {};
+    T* slice_old_high_de_sub_block[7] = {};
     for (int i = 0; i < 7; ++i) {
-        slice_low_ra_de_sub_block[i] = new float[low_dim_z * low_dim_y * low_dim_x]();
-        slice_high_ra_de_sub_block[i] = new float[dim_z * dim_y * dim_x]();
-        slice_old_high_de_sub_block[i] = new float[dim_z * dim_y * dim_x]();
+        slice_low_ra_de_sub_block[i] = new T[low_dim_z * low_dim_y * low_dim_x]();
+        slice_high_ra_de_sub_block[i] = new T[dim_z * dim_y * dim_x]();
+        slice_old_high_de_sub_block[i] = new T[dim_z * dim_y * dim_x]();
     }
 
     size_t slice_low_symbols = 0;
@@ -1449,7 +1531,7 @@ int main(int argc, char* argv[])
         const int block = low_slice_blocks[i];
         size_t decodedSymbols = 0;
         size_t unpredZeros = 0;
-        slice_low_ra_deData[block] = SZ_decompress_nopred_marked_chunks(
+        slice_low_ra_deData[block] = SZ_decompress_nopred_marked_chunks<T>(
             low_comp[block], low_compressedSize[block],
             low_dim_x, low_dim_y, low_dim_z, roi_low_dim, low_slice_chunks,
             decodedSymbols, unpredZeros);
@@ -1476,7 +1558,7 @@ int main(int argc, char* argv[])
         const int block = high_slice_blocks[i];
         size_t decodedSymbols = 0;
         size_t unpredZeros = 0;
-        slice_high_ra_deData[block] = SZ_decompress_nopred_marked_chunks(
+        slice_high_ra_deData[block] = SZ_decompress_nopred_marked_chunks<T>(
             comp[block], compressedSize[block],
             dim_x, dim_y, dim_z, roi_high_dim, high_slice_chunks,
             decodedSymbols, unpredZeros);
@@ -1552,8 +1634,8 @@ int main(int argc, char* argv[])
     double roi_eval_time = std::chrono::duration_cast<std::chrono::nanoseconds>(roi_eval_end - roi_eval_start).count() * 1e-9;
 
     auto reconstructed_full_start = std::chrono::high_resolution_clock::now();
-    float* reconstructed_full_data = new float[full_dim_z * full_dim_y * full_dim_x];
-    float* all_sub_blocks[8] = {
+    T* reconstructed_full_data = new T[full_dim_z * full_dim_y * full_dim_x];
+    T* all_sub_blocks[8] = {
         reconstructed_sub_0,          // vs ori sub_block_0
         de_sub_block[0],      // sub_block_1
         de_sub_block[1],      // sub_block_2
@@ -1625,4 +1707,26 @@ int main(int argc, char* argv[])
     }
 
     return 0;
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc < 5) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <error_bound> <raw_file> <cube_dim> <-f|-d> [x0 y0 z0 x1 y1 z1]"
+                  << std::endl;
+        return 1;
+    }
+
+    const std::string type_flag = argv[4];
+    if (type_flag == "-f") {
+        return run_typed<float>(argc, argv);
+    }
+    if (type_flag == "-d") {
+        return run_typed<double>(argc, argv);
+    }
+
+    std::cerr << "Invalid data type flag '" << type_flag
+              << "'. Use -f for float or -d for double." << std::endl;
+    return 1;
 }
