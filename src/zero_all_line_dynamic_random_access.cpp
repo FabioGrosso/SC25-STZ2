@@ -30,17 +30,24 @@ constexpr int roi_full_dim = 64;
 constexpr int roi_high_dim = 32;
 constexpr int roi_low_dim = 16;
 
-static void set_cube_dims(int full_dim)
+static void set_full_dims(int x, int y, int z)
 {
-    full_dim_x = full_dim_y = full_dim_z = full_dim;
-    dim_x = dim_y = dim_z = full_dim / 2;
-    low_dim_x = low_dim_y = low_dim_z = full_dim / 4;
+    full_dim_x = x;
+    full_dim_y = y;
+    full_dim_z = z;
+    dim_x = x / 2;
+    dim_y = y / 2;
+    dim_z = z / 2;
+    low_dim_x = x / 4;
+    low_dim_y = y / 4;
+    low_dim_z = z / 4;
 }
 
-static size_t marker_table_bytes_per_stream(size_t block_dim, size_t chunk_dim)
+static size_t marker_table_bytes_per_stream(size_t block_dim_x, size_t block_dim_y,
+                                            size_t block_dim_z, size_t chunk_dim)
 {
-    const size_t chunks_per_dim = block_dim / chunk_dim;
-    return chunks_per_dim * chunks_per_dim * chunks_per_dim * sizeof(uint64_t);
+    return (block_dim_x / chunk_dim) * (block_dim_y / chunk_dim) *
+           (block_dim_z / chunk_dim) * sizeof(uint64_t);
 }
 
 static size_t file_size_bytes(const std::string& filepath)
@@ -508,7 +515,7 @@ template <typename T>
 char* SZ_compress(T* oriData, size_t blksize_x, size_t blksize_y, size_t blksize_z,
                   size_t marker_chunk_dim, double eb, size_t& outSize)
 {
-    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, marker_chunk_dim);
+    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, blksize_y, blksize_z, marker_chunk_dim);
     SZ3::Config conf(blksize_z, blksize_y, blksize_x);
     conf.cmprAlgo = SZ3::ALGO_NOPRED;
     conf.errorBoundMode = SZ3::EB_ABS;
@@ -546,7 +553,7 @@ T* SZ_decompress_separated(char* compressedData, size_t outSize,
                            size_t blksize_x, size_t blksize_y, size_t blksize_z,
                            size_t marker_chunk_dim)
 {
-    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, marker_chunk_dim);
+    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, blksize_y, blksize_z, marker_chunk_dim);
     SZ3::Config conf(blksize_z, blksize_y, blksize_x);
     conf.cmprAlgo = SZ3::ALGO_NOPRED;
     conf.errorBoundMode = SZ3::EB_ABS;
@@ -556,20 +563,25 @@ T* SZ_decompress_separated(char* compressedData, size_t outSize,
     return deData;
 }
 
-static inline size_t chunk_index_3d(size_t cx, size_t cy, size_t cz, size_t chunks_per_dim)
+static inline size_t chunk_index_3d(size_t cx, size_t cy, size_t cz,
+                                    size_t chunks_x, size_t chunks_y)
 {
-    return (cz * chunks_per_dim + cy) * chunks_per_dim + cx;
+    return (cz * chunks_y + cy) * chunks_x + cx;
 }
 
-std::vector<size_t> chunks_for_z_slice(size_t block_dim, size_t chunk_dim, size_t z)
+std::vector<size_t> chunks_for_z_slice(size_t block_dim_x, size_t block_dim_y,
+                                       size_t block_dim_z, size_t chunk_dim, size_t z)
 {
-    const size_t chunks_per_dim = block_dim / chunk_dim;
+    const size_t chunks_x = block_dim_x / chunk_dim;
+    const size_t chunks_y = block_dim_y / chunk_dim;
+    const size_t chunks_z = block_dim_z / chunk_dim;
     const size_t cz = z / chunk_dim;
     std::vector<size_t> chunks;
-    chunks.reserve(chunks_per_dim * chunks_per_dim);
-    for (size_t cy = 0; cy < chunks_per_dim; ++cy) {
-        for (size_t cx = 0; cx < chunks_per_dim; ++cx) {
-            chunks.push_back(chunk_index_3d(cx, cy, cz, chunks_per_dim));
+    if (cz >= chunks_z) return chunks;
+    chunks.reserve(chunks_x * chunks_y);
+    for (size_t cy = 0; cy < chunks_y; ++cy) {
+        for (size_t cx = 0; cx < chunks_x; ++cx) {
+            chunks.push_back(chunk_index_3d(cx, cy, cz, chunks_x, chunks_y));
         }
     }
     return chunks;
@@ -635,31 +647,35 @@ AxisRange range_for_parity(AxisRange fullRange, int parity)
     return {first / 2, last / 2};
 }
 
-std::vector<size_t> chunks_for_box(size_t block_dim, size_t chunk_dim, AxisRange x, AxisRange y, AxisRange z)
+std::vector<size_t> chunks_for_box(size_t block_dim_x, size_t block_dim_y, size_t block_dim_z,
+                                   size_t chunk_dim, AxisRange x, AxisRange y, AxisRange z)
 {
     if (x.begin > x.end || y.begin > y.end || z.begin > z.end) {
         return {};
     }
-    const size_t chunks_per_dim = block_dim / chunk_dim;
+    const size_t chunks_x = block_dim_x / chunk_dim;
+    const size_t chunks_y = block_dim_y / chunk_dim;
+    const size_t chunks_z = block_dim_z / chunk_dim;
     const int cx0 = std::max(0, x.begin / static_cast<int>(chunk_dim));
     const int cy0 = std::max(0, y.begin / static_cast<int>(chunk_dim));
     const int cz0 = std::max(0, z.begin / static_cast<int>(chunk_dim));
-    const int cx1 = std::min(static_cast<int>(chunks_per_dim) - 1, x.end / static_cast<int>(chunk_dim));
-    const int cy1 = std::min(static_cast<int>(chunks_per_dim) - 1, y.end / static_cast<int>(chunk_dim));
-    const int cz1 = std::min(static_cast<int>(chunks_per_dim) - 1, z.end / static_cast<int>(chunk_dim));
+    const int cx1 = std::min(static_cast<int>(chunks_x) - 1, x.end / static_cast<int>(chunk_dim));
+    const int cy1 = std::min(static_cast<int>(chunks_y) - 1, y.end / static_cast<int>(chunk_dim));
+    const int cz1 = std::min(static_cast<int>(chunks_z) - 1, z.end / static_cast<int>(chunk_dim));
     std::vector<size_t> chunks;
     chunks.reserve((cx1 - cx0 + 1) * (cy1 - cy0 + 1) * (cz1 - cz0 + 1));
     for (int cz = cz0; cz <= cz1; ++cz) {
         for (int cy = cy0; cy <= cy1; ++cy) {
             for (int cx = cx0; cx <= cx1; ++cx) {
-                chunks.push_back(chunk_index_3d(cx, cy, cz, chunks_per_dim));
+                chunks.push_back(chunk_index_3d(cx, cy, cz, chunks_x, chunks_y));
             }
         }
     }
     return chunks;
 }
 
-std::vector<BlockAccessPlan> build_residual_plan(const QueryBox& q, int block_dim, int chunk_dim)
+std::vector<BlockAccessPlan> build_residual_plan(const QueryBox& q, int block_dim_x,
+                                                 int block_dim_y, int block_dim_z, int chunk_dim)
 {
     std::vector<BlockAccessPlan> plans;
     for (int block = 0; block < 7; ++block) {
@@ -675,7 +691,8 @@ std::vector<BlockAccessPlan> build_residual_plan(const QueryBox& q, int block_di
         if (p.x.begin > p.x.end || p.y.begin > p.y.end || p.z.begin > p.z.end) {
             continue;
         }
-        p.chunks = chunks_for_box(block_dim, chunk_dim, p.x, p.y, p.z);
+        p.chunks = chunks_for_box(block_dim_x, block_dim_y, block_dim_z, chunk_dim,
+                                  p.x, p.y, p.z);
         plans.push_back(std::move(p));
     }
     return plans;
@@ -780,7 +797,8 @@ std::vector<BlockAccessPlan> build_low_residual_plan(const std::vector<QueryBox>
             if (p.x.begin > p.x.end || p.y.begin > p.y.end || p.z.begin > p.z.end) {
                 continue;
             }
-            const auto chunks = chunks_for_box(low_dim_x, roi_low_dim, p.x, p.y, p.z);
+            const auto chunks = chunks_for_box(low_dim_x, low_dim_y, low_dim_z,
+                                               roi_low_dim, p.x, p.y, p.z);
             chunk_sets[block].insert(chunks.begin(), chunks.end());
             merge_axis(accum[block].x, p.x);
             merge_axis(accum[block].y, p.y);
@@ -814,7 +832,7 @@ T* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
                                            size_t chunk_dim, const std::vector<size_t>& rowMajorChunks,
                                            size_t& decodedSymbols, size_t& unpredZeros)
 {
-    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, chunk_dim);
+    SZ3::HuffmanEncoder<int>::set_forced_marker(blksize_x, blksize_y, blksize_z, chunk_dim);
     SZ3::uchar* buffer = nullptr;
     size_t bufferSize = 0;
     SZ3::Lossless_zstd lossless;
@@ -845,16 +863,17 @@ T* SZ_decompress_nopred_marked_chunks(char* compressedData, size_t outSize,
     encoder.postprocess_decode();
 
     T* deData = new T[blksize_x * blksize_y * blksize_z];
-    const size_t chunks_per_dim = blksize_x / chunk_dim;
+    const size_t chunks_x = blksize_x / chunk_dim;
+    const size_t chunks_y = blksize_y / chunk_dim;
     const size_t chunk_volume = chunk_dim * chunk_dim * chunk_dim;
     decodedSymbols = quant_inds.size();
     unpredZeros = 0;
 
     size_t q = 0;
     for (size_t rowMajorChunk : rowMajorChunks) {
-        const size_t cx = rowMajorChunk % chunks_per_dim;
-        const size_t cy = (rowMajorChunk / chunks_per_dim) % chunks_per_dim;
-        const size_t cz = rowMajorChunk / (chunks_per_dim * chunks_per_dim);
+        const size_t cx = rowMajorChunk % chunks_x;
+        const size_t cy = (rowMajorChunk / chunks_x) % chunks_y;
+        const size_t cz = rowMajorChunk / (chunks_x * chunks_y);
         const size_t x0 = cx * chunk_dim;
         const size_t y0 = cy * chunk_dim;
         const size_t z0 = cz * chunk_dim;
@@ -925,24 +944,39 @@ int run_typed(int argc, char* argv[])
 {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <error_bound> <raw_file> <cube_dim> <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
+                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
                   << std::endl;
         return 1;
     }
     const double eb = atof(argv[1]);
     const std::string full_file_path = argv[2];
-    const int full_dim = atoi(argv[3]);
-    if (full_dim <= 0 || full_dim % 4 != 0) {
-        std::cerr << "cube_dim must be positive and divisible by 4, got " << argv[3] << std::endl;
+    const bool old_cube_args = std::string(argv[4]) == "-f" || std::string(argv[4]) == "-d";
+    const int type_arg = old_cube_args ? 4 : 6;
+    if (!old_cube_args && argc < 7) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
+                  << std::endl;
         return 1;
     }
-    if ((full_dim / 2) % roi_high_dim != 0 || (full_dim / 4) % roi_low_dim != 0) {
-        std::cerr << "cube_dim " << full_dim
+    const int input_full_x = atoi(argv[3]);
+    const int input_full_y = old_cube_args ? input_full_x : atoi(argv[4]);
+    const int input_full_z = old_cube_args ? input_full_x : atoi(argv[5]);
+    if (input_full_x <= 0 || input_full_y <= 0 || input_full_z <= 0 ||
+        input_full_x % 4 != 0 || input_full_y % 4 != 0 || input_full_z % 4 != 0) {
+        std::cerr << "dims must be positive and divisible by 4, got "
+                  << input_full_x << " x " << input_full_y << " x " << input_full_z << std::endl;
+        return 1;
+    }
+    if ((input_full_x / 2) % roi_high_dim != 0 || (input_full_y / 2) % roi_high_dim != 0 ||
+        (input_full_z / 2) % roi_high_dim != 0 ||
+        (input_full_x / 4) % roi_low_dim != 0 || (input_full_y / 4) % roi_low_dim != 0 ||
+        (input_full_z / 4) % roi_low_dim != 0) {
+        std::cerr << "dims " << input_full_x << " x " << input_full_y << " x " << input_full_z
                   << " is incompatible with high " << roi_high_dim << "^3 and low "
                   << roi_low_dim << "^3 marker chunks." << std::endl;
         return 1;
     }
-    set_cube_dims(full_dim);
+    set_full_dims(input_full_x, input_full_y, input_full_z);
 
     const size_t full_size = static_cast<size_t>(full_dim_z) * full_dim_y * full_dim_x;
     const size_t expected_bytes = full_size * sizeof(T);
@@ -955,13 +989,14 @@ int run_typed(int argc, char* argv[])
         std::cerr << "Input file size mismatch for "
                   << (sizeof(T) == sizeof(float) ? "float" : "double")
                   << ": expected " << expected_bytes << " bytes for "
-                  << full_dim << "^3, got " << actual_bytes << " bytes." << std::endl;
+                  << full_dim_x << " x " << full_dim_y << " x " << full_dim_z
+                  << ", got " << actual_bytes << " bytes." << std::endl;
         return 1;
     }
 
     bool full_validate = true;
     std::vector<int> query_args;
-    for (int arg = 5; arg < argc; ++arg) {
+    for (int arg = type_arg + 1; arg < argc; ++arg) {
         const std::string token = argv[arg];
         if (token == "--query-only" || token == "--no-full-validate") {
             full_validate = false;
@@ -977,8 +1012,10 @@ int run_typed(int argc, char* argv[])
         query_args.push_back(static_cast<int>(value));
     }
 
-    const int default_roi_dim = std::min(roi_full_dim, full_dim);
-    QueryBox query = make_query(0, 0, 0, default_roi_dim - 1, default_roi_dim - 1, default_roi_dim - 1);
+    const int default_roi_x = std::min(roi_full_dim, full_dim_x);
+    const int default_roi_y = std::min(roi_full_dim, full_dim_y);
+    const int default_roi_z = std::min(roi_full_dim, full_dim_z);
+    QueryBox query = make_query(0, 0, 0, default_roi_x - 1, default_roi_y - 1, default_roi_z - 1);
     if (!query_args.empty()) {
         if (query_args.size() != 6) {
             std::cerr << "ROI query must provide exactly six integers: x0 y0 z0 x1 y1 z1" << std::endl;
@@ -988,14 +1025,18 @@ int run_typed(int argc, char* argv[])
                            query_args[3], query_args[4], query_args[5]);
     }
     if (query.x.begin < 0 || query.y.begin < 0 || query.z.begin < 0 ||
-        query.x.end >= full_dim || query.y.end >= full_dim || query.z.end >= full_dim) {
-        std::cerr << "ROI query is out of bounds for cube_dim " << full_dim << std::endl;
+        query.x.end >= full_dim_x || query.y.end >= full_dim_y || query.z.end >= full_dim_z) {
+        std::cerr << "ROI query is out of bounds for dims "
+                  << full_dim_x << " x " << full_dim_y << " x " << full_dim_z << std::endl;
         return 1;
     }
-    std::cout << "Random-access Huffman marker test: low " << low_dim_x << "^3 uses "
-              << roi_low_dim << "^3 markers, high " << dim_x << "^3 uses "
+    std::cout << "Random-access Huffman marker test: low "
+              << low_dim_x << " x " << low_dim_y << " x " << low_dim_z << " uses "
+              << roi_low_dim << "^3 markers, high "
+              << dim_x << " x " << dim_y << " x " << dim_z << " uses "
               << roi_high_dim << "^3 markers." << std::endl;
-    std::cout << "Input: " << full_file_path << ", dim: " << full_dim
+    std::cout << "Input: " << full_file_path << ", dims: "
+              << full_dim_x << " x " << full_dim_y << " x " << full_dim_z
               << ", type: " << (sizeof(T) == sizeof(float) ? "float" : "double") << std::endl;
     std::cout << "Query [" << query.x.begin << "," << query.x.end << "] x ["
               << query.y.begin << "," << query.y.end << "] x ["
@@ -1133,10 +1174,12 @@ int run_typed(int argc, char* argv[])
     double CR = original_size / (double)allSize;
     std::cout << "CR: " << CR << std::endl;
     std::cout << "raw marker bytes counted before zstd: "
-              << 7 * marker_table_bytes_per_stream(low_dim_x, roi_low_dim) +
-                     7 * marker_table_bytes_per_stream(dim_x, roi_high_dim)
-              << " (7 low streams x " << marker_table_bytes_per_stream(low_dim_x, roi_low_dim)
-              << " + 7 high streams x " << marker_table_bytes_per_stream(dim_x, roi_high_dim)
+              << 7 * marker_table_bytes_per_stream(low_dim_x, low_dim_y, low_dim_z, roi_low_dim) +
+                     7 * marker_table_bytes_per_stream(dim_x, dim_y, dim_z, roi_high_dim)
+              << " (7 low streams x "
+              << marker_table_bytes_per_stream(low_dim_x, low_dim_y, low_dim_z, roi_low_dim)
+              << " + 7 high streams x "
+              << marker_table_bytes_per_stream(dim_x, dim_y, dim_z, roi_high_dim)
               << ")" << std::endl;
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -1210,7 +1253,7 @@ int run_typed(int argc, char* argv[])
     //           << time_taken_decompress << " sec" << std::endl;
 
     auto roi_eval_start = std::chrono::high_resolution_clock::now();
-    const auto highPlans = build_residual_plan(query, dim_x, roi_high_dim);
+    const auto highPlans = build_residual_plan(query, dim_x, dim_y, dim_z, roi_high_dim);
     auto highRefRegions = build_high_ref_regions(highPlans);
     const QueryBox querySub0Region = build_query_sub0_region(query);
     if (querySub0Region.x.begin <= querySub0Region.x.end &&
@@ -1560,8 +1603,10 @@ int run_typed(int argc, char* argv[])
             low_slice_blocks.push_back(block);
         }
     }
-    const std::vector<size_t> low_slice_chunks = chunks_for_z_slice(low_dim_x, roi_low_dim, low_slice_z);
-    const std::vector<size_t> high_slice_chunks = chunks_for_z_slice(dim_x, roi_high_dim, high_slice_z);
+    const std::vector<size_t> low_slice_chunks = chunks_for_z_slice(low_dim_x, low_dim_y, low_dim_z,
+                                                                    roi_low_dim, low_slice_z);
+    const std::vector<size_t> high_slice_chunks = chunks_for_z_slice(dim_x, dim_y, dim_z,
+                                                                     roi_high_dim, high_slice_z);
 
     T* slice_low_ra_deData[7] = {};
     T* slice_low_ra_de_sub_block[7] = {};
@@ -1802,12 +1847,25 @@ int main(int argc, char* argv[])
 {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <error_bound> <raw_file> <cube_dim> <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
+                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
                   << std::endl;
         return 1;
     }
 
-    const std::string type_flag = argv[4];
+    int type_arg = -1;
+    if (std::string(argv[4]) == "-f" || std::string(argv[4]) == "-d") {
+        type_arg = 4;
+    } else if (argc >= 7 && (std::string(argv[6]) == "-f" || std::string(argv[6]) == "-d")) {
+        type_arg = 6;
+    }
+    if (type_arg < 0) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
+                  << std::endl;
+        return 1;
+    }
+
+    const std::string type_flag = argv[type_arg];
     if (type_flag == "-f") {
         return run_typed<float>(argc, argv);
     }
