@@ -28,8 +28,8 @@ int low_dim_z = 128;
 int low_dim_y = 128;
 int low_dim_x = 128;
 constexpr int roi_full_dim = 64;
-constexpr int roi_high_dim = 32;
-constexpr int roi_low_dim = 16;
+int roi_high_dim = 32;
+int roi_low_dim = 16;
 
 static void set_full_dims(int x, int y, int z)
 {
@@ -1327,7 +1327,7 @@ int run_typed(int argc, char* argv[])
 {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
+                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--chunks high low] [--query-only] [x0 y0 z0 x1 y1 z1]"
                   << std::endl;
         return 1;
     }
@@ -1337,7 +1337,7 @@ int run_typed(int argc, char* argv[])
     const int type_arg = old_cube_args ? 4 : 6;
     if (!old_cube_args && argc < 7) {
         std::cerr << "Usage: " << argv[0]
-                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
+                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--chunks high low] [--query-only] [x0 y0 z0 x1 y1 z1]"
                   << std::endl;
         return 1;
     }
@@ -1349,6 +1349,22 @@ int run_typed(int argc, char* argv[])
         std::cerr << "dims must be positive and divisible by 4, got "
                   << input_full_x << " x " << input_full_y << " x " << input_full_z << std::endl;
         return 1;
+    }
+    for (int arg = type_arg + 1; arg < argc; ++arg) {
+        if (std::string(argv[arg]) == "--chunks") {
+            if (arg + 2 >= argc) {
+                std::cerr << "--chunks requires two integers: <high_dim> <low_dim>" << std::endl;
+                return 1;
+            }
+            roi_high_dim = atoi(argv[arg + 1]);
+            roi_low_dim = atoi(argv[arg + 2]);
+            if (roi_high_dim <= 0 || roi_low_dim <= 0) {
+                std::cerr << "--chunks dims must be positive, got "
+                          << argv[arg + 1] << " " << argv[arg + 2] << std::endl;
+                return 1;
+            }
+            break;
+        }
     }
     if ((input_full_x / 2) % roi_high_dim != 0 || (input_full_y / 2) % roi_high_dim != 0 ||
         (input_full_z / 2) % roi_high_dim != 0 ||
@@ -1389,6 +1405,10 @@ int run_typed(int argc, char* argv[])
         }
         if (token == "--auto-query") {
             run_auto_query = true;
+            continue;
+        }
+        if (token == "--chunks") {
+            arg += 2;
             continue;
         }
         char* end = nullptr;
@@ -2308,7 +2328,7 @@ int main(int argc, char* argv[])
 {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
+                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--chunks high low] [--query-only] [x0 y0 z0 x1 y1 z1]"
                   << std::endl;
         return 1;
     }
@@ -2321,7 +2341,7 @@ int main(int argc, char* argv[])
     }
     if (type_arg < 0) {
         std::cerr << "Usage: " << argv[0]
-                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--query-only] [x0 y0 z0 x1 y1 z1]"
+                  << " <error_bound> <raw_file> <dim_x> [dim_y dim_z] <-f|-d> [--chunks high low] [--query-only] [x0 y0 z0 x1 y1 z1]"
                   << std::endl;
         return 1;
     }
